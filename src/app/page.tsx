@@ -1,65 +1,152 @@
-import Image from "next/image";
+"use client";
 
-export default function Home() {
+import { useEffect, useState } from "react";
+import Link from "next/link";
+
+interface Project {
+  id: string;
+  name: string;
+  description: string | null;
+  createdAt: string;
+  _count: { drawings: number };
+  drawings: { extractionStatus: string }[];
+}
+
+export default function HomePage() {
+  const [projects, setProjects] = useState<Project[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [creating, setCreating] = useState(false);
+  const [newName, setNewName] = useState("");
+  const [newDesc, setNewDesc] = useState("");
+  const [showForm, setShowForm] = useState(false);
+
+  async function load() {
+    const res = await fetch("/api/projects");
+    setProjects(await res.json());
+    setLoading(false);
+  }
+
+  useEffect(() => { load(); }, []);
+
+  async function createProject(e: React.FormEvent) {
+    e.preventDefault();
+    if (!newName.trim()) return;
+    setCreating(true);
+    await fetch("/api/projects", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: newName.trim(), description: newDesc.trim() || null }),
+    });
+    setNewName("");
+    setNewDesc("");
+    setShowForm(false);
+    setCreating(false);
+    load();
+  }
+
+  function statusSummary(drawings: { extractionStatus: string }[]) {
+    const counts: Record<string, number> = {};
+    for (const d of drawings) counts[d.extractionStatus] = (counts[d.extractionStatus] || 0) + 1;
+    return counts;
+  }
+
+  const statusColors: Record<string, string> = {
+    pending: "bg-gray-100 text-gray-600",
+    processing: "bg-blue-100 text-blue-700",
+    extracted: "bg-yellow-100 text-yellow-700",
+    cover_sheet: "bg-purple-100 text-purple-700",
+    reviewed: "bg-green-100 text-green-700",
+    published: "bg-emerald-100 text-emerald-700",
+  };
+
+  if (loading) return <div className="p-8 text-gray-500">Loading…</div>;
+
   return (
-    <div className="flex flex-col flex-1 items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-      <main className="flex flex-1 w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white dark:bg-black sm:items-start">
-        <Image
-          className="dark:invert"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={100}
-          height={20}
-          priority
-        />
-        <div className="flex flex-col items-center gap-6 text-center sm:items-start sm:text-left">
-          <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
-            To get started, edit the page.tsx file.
-          </h1>
-          <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
-            Looking for a starting point or more instructions? Head over to{" "}
-            <a
-              href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
+    <div className="max-w-4xl mx-auto p-8">
+      <div className="flex items-center justify-between mb-6">
+        <h1 className="text-2xl font-semibold">Projects</h1>
+        <button
+          onClick={() => setShowForm(!showForm)}
+          className="bg-gray-900 text-white text-sm px-4 py-2 rounded-lg hover:bg-gray-700"
+        >
+          + New Project
+        </button>
+      </div>
+
+      {showForm && (
+        <form onSubmit={createProject} className="bg-white border border-gray-200 rounded-xl p-5 mb-6 flex flex-col gap-3">
+          <h2 className="font-medium text-sm text-gray-700">New Project</h2>
+          <input
+            value={newName}
+            onChange={(e) => setNewName(e.target.value)}
+            placeholder="Project name (e.g. Waterman)"
+            className="border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-gray-900"
+            autoFocus
+          />
+          <input
+            value={newDesc}
+            onChange={(e) => setNewDesc(e.target.value)}
+            placeholder="Description (optional)"
+            className="border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-gray-900"
+          />
+          <div className="flex gap-2">
+            <button
+              type="submit"
+              disabled={creating || !newName.trim()}
+              className="bg-gray-900 text-white text-sm px-4 py-2 rounded-lg hover:bg-gray-700 disabled:opacity-50"
             >
-              Templates
-            </a>{" "}
-            or the{" "}
-            <a
-              href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
+              {creating ? "Creating…" : "Create"}
+            </button>
+            <button
+              type="button"
+              onClick={() => setShowForm(false)}
+              className="text-sm text-gray-500 px-4 py-2 rounded-lg hover:bg-gray-100"
             >
-              Learning
-            </a>{" "}
-            center.
-          </p>
+              Cancel
+            </button>
+          </div>
+        </form>
+      )}
+
+      {projects.length === 0 ? (
+        <div className="text-center py-16 text-gray-400">
+          <p className="text-lg">No projects yet.</p>
+          <p className="text-sm mt-1">Create one to start uploading drawings.</p>
         </div>
-        <div className="flex flex-col gap-4 text-base font-medium sm:flex-row">
-          <a
-            className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-foreground px-5 text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc] md:w-[158px]"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <Image
-              className="dark:invert"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={16}
-              height={16}
-            />
-            Deploy Now
-          </a>
-          <a
-            className="flex h-12 w-full items-center justify-center rounded-full border border-solid border-black/[.08] px-5 transition-colors hover:border-transparent hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a] md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Documentation
-          </a>
+      ) : (
+        <div className="flex flex-col gap-3">
+          {projects.map((p) => {
+            const summary = statusSummary(p.drawings);
+            return (
+              <Link
+                key={p.id}
+                href={`/projects/${p.id}`}
+                className="bg-white border border-gray-200 rounded-xl p-5 hover:border-gray-400 transition-colors"
+              >
+                <div className="flex items-start justify-between">
+                  <div>
+                    <div className="font-medium">{p.name}</div>
+                    {p.description && <div className="text-sm text-gray-500 mt-0.5">{p.description}</div>}
+                  </div>
+                  <div className="text-sm text-gray-400">{p._count.drawings} drawing{p._count.drawings !== 1 ? "s" : ""}</div>
+                </div>
+                {p.drawings.length > 0 && (
+                  <div className="flex flex-wrap gap-1.5 mt-3">
+                    {Object.entries(summary).map(([status, count]) => (
+                      <span
+                        key={status}
+                        className={`text-xs px-2 py-0.5 rounded-full font-medium ${statusColors[status] || "bg-gray-100 text-gray-600"}`}
+                      >
+                        {count} {status.replace("_", " ")}
+                      </span>
+                    ))}
+                  </div>
+                )}
+              </Link>
+            );
+          })}
         </div>
-      </main>
+      )}
     </div>
   );
 }

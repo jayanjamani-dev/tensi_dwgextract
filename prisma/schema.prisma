@@ -1,0 +1,102 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "sqlite"
+}
+
+model Project {
+  id          String    @id @default(cuid())
+  name        String
+  description String?
+  createdAt   DateTime  @default(now())
+  drawings    Drawing[]
+}
+
+model Architect {
+  id         String     @id @default(cuid())
+  firmName   String
+  firmAddress String?
+  createdAt  DateTime   @default(now())
+  drawings   Drawing[]
+  template   Template?
+}
+
+model Drawing {
+  id          String    @id @default(cuid())
+  projectId   String
+  project     Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  architectId String?
+  architect   Architect? @relation(fields: [architectId], references: [id])
+
+  filename    String
+  filepath    String
+
+  // Extracted fields
+  drawingNumber  String?
+  drawingTitle   String?
+  revision       String?
+  revisionDate   String?
+  status         String?
+
+  // Confidence scores
+  confidenceDrawingNumber  Float?
+  confidenceDrawingTitle   Float?
+  confidenceRevision       Float?
+  confidenceRevisionDate   Float?
+  confidenceStatus         Float?
+
+  // Conflict info
+  conflictDetected Boolean @default(false)
+  conflictDetail   String?
+
+  // Document metadata returned by Gemini
+  documentType           String? // drawing | cover_sheet | specification | unknown
+  titleBlockLocation     String? // bottom | bottom-right | right | left | unknown
+  revisionBlockLocation  String? // top-left | left-of-title-block | integrated | none | unknown
+
+  // Extraction metadata
+  extractionModel  String?
+  pdfplumberRaw    String? // JSON string — full text element array
+  flags            String? // JSON string — array of flag strings
+  notes            String?
+
+  // Status workflow
+  extractionStatus String @default("pending") // pending | processing | extracted | cover_sheet | reviewed | published
+
+  // Timestamps
+  extractedAt   DateTime?
+  reviewedAt    DateTime?
+  publishedAt   DateTime?
+  createdAt     DateTime  @default(now())
+
+  corrections   Correction[]
+}
+
+model Correction {
+  id             String   @id @default(cuid())
+  drawingId      String
+  drawing        Drawing  @relation(fields: [drawingId], references: [id], onDelete: Cascade)
+  fieldName      String
+  originalValue  String?
+  correctedValue String?
+  correctedAt    DateTime @default(now())
+}
+
+model Template {
+  id                    String    @id @default(cuid())
+  architectId           String    @unique
+  architect             Architect @relation(fields: [architectId], references: [id], onDelete: Cascade)
+  titleBlockLocation    String?   // bottom | bottom-right | right | left | unknown
+  revisionBlockLocation String?   // top-left | left-of-title-block | integrated | none | unknown
+  revisionColumnOrder   String?   // JSON array e.g. ["rev","date","description","by"]
+  revisionReadingDirection String? // top-to-bottom | bottom-to-top
+  fieldLabelMap         String?   // JSON object mapping discovered labels to canonical names
+  sampleDrawingId       String?
+  lastUpdated           DateTime  @default(now())
+}
