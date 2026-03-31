@@ -1,4 +1,13 @@
-import { GeminiExtractionResult } from "./gemini";
+import { GeminiExtractionResult, FieldCoordinate } from "./gemini";
+
+export interface FieldCoordinates {
+  drawing_number: FieldCoordinate | null;
+  drawing_title: FieldCoordinate | null;
+  revision: FieldCoordinate | null;
+  revision_date: FieldCoordinate | null;
+  status: FieldCoordinate | null;
+  location: FieldCoordinate | null;
+}
 
 export interface ValidationResult {
   drawingNumber: string | null;
@@ -6,6 +15,8 @@ export interface ValidationResult {
   revision: string | null;
   revisionDate: string | null;
   status: string | null;
+  location: string | null;
+  fieldCoordinates: FieldCoordinates | null;
   confidenceDrawingNumber: number;
   confidenceDrawingTitle: number;
   confidenceRevision: number;
@@ -201,6 +212,8 @@ export function validateExtraction(
     revision,
     revisionDate,
     status,
+    location: raw.location ?? null,
+    fieldCoordinates: raw.field_coordinates ?? null,
     confidenceDrawingNumber: raw.confidence.drawing_number,
     confidenceDrawingTitle: raw.confidence.drawing_title,
     confidenceRevision: raw.confidence.revision,

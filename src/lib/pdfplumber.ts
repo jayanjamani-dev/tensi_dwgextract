@@ -16,43 +16,55 @@ export interface PdfPlumberResult {
   error?: string;
 }
 
-export async function extractTextFromPdf(pdfPath: string): Promise<PdfPlumberResult> {
-  const scriptPath = path.join(process.cwd(), "scripts", "extract_text.py");
-  const absolutePdfPath = path.isAbsolute(pdfPath)
+function resolvePdfPath(pdfPath: string): string {
+  return path.isAbsolute(pdfPath)
     ? pdfPath
     : path.join(process.cwd(), pdfPath);
+}
 
-  return new Promise((resolve) => {
-    // Try python3 first, fall back to python
-    const pythonCmd = process.platform === "win32" ? "python" : "python3";
+function runPython(args: string[]): Promise<string> {
+  const scriptPath = path.join(process.cwd(), "scripts", "extract_text.py");
+  const pythonCmd = process.platform === "win32" ? "python" : "python3";
 
-    const child = spawn(pythonCmd, [scriptPath, absolutePdfPath], {
-      env: process.env,
-    });
-
+  return new Promise((resolve, reject) => {
+    const child = spawn(pythonCmd, [scriptPath, ...args], { env: process.env });
     let stdout = "";
     let stderr = "";
 
-    child.stdout.on("data", (data) => { stdout += data.toString(); });
-    child.stderr.on("data", (data) => { stderr += data.toString(); });
-
-    child.on("error", (err) => {
-      resolve({ elements: [], scanned: false, error: `Failed to run Python: ${err.message}` });
-    });
-
+    child.stdout.on("data", (d) => { stdout += d.toString(); });
+    child.stderr.on("data", (d) => { stderr += d.toString(); });
+    child.on("error", (err) => reject(new Error(`Failed to run Python: ${err.message}`)));
     child.on("close", (code) => {
-      if (code !== 0) {
-        resolve({ elements: [], scanned: false, error: stderr || `Python exited with code ${code}` });
-        return;
-      }
-
-      try {
-        const elements: TextElement[] = JSON.parse(stdout.trim());
-        const scanned = elements.length === 0;
-        resolve({ elements, scanned });
-      } catch {
-        resolve({ elements: [], scanned: false, error: `JSON parse error: ${stdout.slice(0, 200)}` });
-      }
+      if (code !== 0) reject(new Error(stderr || `Python exited with code ${code}`));
+      else resolve(stdout.trim());
     });
   });
+}
+
+/** Returns the number of pages in a PDF. Falls back to 1 on error. */
+export async function getPageCount(pdfPath: string): Promise<number> {
+  const absolutePath = resolvePdfPath(pdfPath);
+  try {
+    const output = await runPython([absolutePath, "--count"]);
+    const result = JSON.parse(output) as { page_count?: number };
+    return result.page_count ?? 1;
+  } catch {
+    return 1;
+  }
+}
+
+/** Extracts text elements from a single page (0-indexed). */
+export async function extractTextFromPdf(
+  pdfPath: string,
+  pageIndex = 0
+): Promise<PdfPlumberResult> {
+  const absolutePath = resolvePdfPath(pdfPath);
+  try {
+    const output = await runPython([absolutePath, String(pageIndex)]);
+    const elements: TextElement[] = JSON.parse(output);
+    return { elements, scanned: elements.length === 0 };
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    return { elements: [], scanned: false, error: errMsg };
+  }
 }

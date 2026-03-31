@@ -36,6 +36,7 @@ model Drawing {
 
   filename    String
   filepath    String
+  pageNumber  Int     @default(0)
 
   // Extracted fields
   drawingNumber  String?
@@ -43,6 +44,8 @@ model Drawing {
   revision       String?
   revisionDate   String?
   status         String?
+  location       String? // site / building address extracted from the drawing
+  fieldCoordinates String? // JSON — {drawing_number:{x,y}, drawing_title:{x,y}, revision:{x,y}, revision_date:{x,y}, status:{x,y}, location:{x,y}}
 
   // Confidence scores
   confidenceDrawingNumber  Float?
@@ -66,6 +69,13 @@ model Drawing {
   flags            String? // JSON string — array of flag strings
   notes            String?
 
+  // Performance / FinOps
+  processingTimeMs  Int?   // total pipeline wall-clock time
+  pdfplumberTimeMs  Int?   // pdfplumber extraction time
+  totalInputTokens  Int?   // sum of all Gemini input tokens for this drawing
+  totalOutputTokens Int?   // sum of all Gemini output tokens
+  totalCostUsd      Float? // sum of all Gemini call costs
+
   // Status workflow
   extractionStatus String @default("pending") // pending | processing | extracted | cover_sheet | reviewed | published
 
@@ -76,6 +86,27 @@ model Drawing {
   createdAt     DateTime  @default(now())
 
   corrections   Correction[]
+  apiCalls      ApiCall[]
+}
+
+model ApiCall {
+  id              String   @id @default(cuid())
+  drawingId       String
+  drawing         Drawing  @relation(fields: [drawingId], references: [id], onDelete: Cascade)
+
+  model           String
+  callType        String   @default("extract") // extract | retry
+  inputTokens     Int      @default(0)
+  outputTokens    Int      @default(0)
+  thinkingTokens  Int      @default(0)
+  totalTokens     Int      @default(0)
+  latencyMs       Int      @default(0)
+  costUsd         Float    @default(0)
+  success         Boolean  @default(true)
+  errorMessage    String?
+  retryCount      Int      @default(0)
+
+  createdAt       DateTime @default(now())
 }
 
 model Correction {

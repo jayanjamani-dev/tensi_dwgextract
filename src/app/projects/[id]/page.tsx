@@ -7,6 +7,7 @@ import Link from "next/link";
 interface Drawing {
   id: string;
   filename: string;
+  pageNumber: number;
   drawingNumber: string | null;
   drawingTitle: string | null;
   revision: string | null;
@@ -299,7 +300,8 @@ export default function ProjectPage() {
                     <td className="px-3 py-2">
                       <div className="flex items-center gap-1.5">
                         {hasConflict && <span className="text-amber-500 text-xs" title="Revision conflict detected">⚠</span>}
-                        <span className="text-gray-700 truncate max-w-[140px]" title={d.filename}>{d.filename}</span>
+                        <span className="text-gray-700 truncate max-w-[140px]" title={`${d.filename} — page ${d.pageNumber + 1}`}>{d.filename}</span>
+                        <span className="text-xs text-gray-400 shrink-0">p.{d.pageNumber + 1}</span>
                         {isCoverSheet && <span className="text-xs bg-purple-100 text-purple-700 px-1.5 py-0.5 rounded-full">cover</span>}
                       </div>
                     </td>

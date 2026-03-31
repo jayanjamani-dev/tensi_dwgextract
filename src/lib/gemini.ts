@@ -1,5 +1,11 @@
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import { TextElement } from "./pdfplumber";
+import { GeminiUsage, GeminiCallMetrics, calculateCost } from "./api-metrics";
+
+export interface FieldCoordinate {
+  x: number;
+  y: number;
+}
 
 export interface GeminiExtractionResult {
   drawing_number: string | null;
@@ -7,12 +13,22 @@ export interface GeminiExtractionResult {
   revision: string | null;
   revision_date: string | null;
   status: string | null;
+  location: string | null;
   confidence: {
     drawing_number: number;
     drawing_title: number;
     revision: number;
     revision_date: number;
     status: number;
+    location: number;
+  };
+  field_coordinates: {
+    drawing_number: FieldCoordinate | null;
+    drawing_title: FieldCoordinate | null;
+    revision: FieldCoordinate | null;
+    revision_date: FieldCoordinate | null;
+    status: FieldCoordinate | null;
+    location: FieldCoordinate | null;
   };
   conflict_detected: boolean;
   conflict_detail: string | null;
@@ -20,6 +36,11 @@ export interface GeminiExtractionResult {
   title_block_location: "bottom" | "bottom-right" | "right" | "left" | "unknown";
   revision_block_location: "top-left" | "left-of-title-block" | "integrated" | "none" | "unknown";
   notes: string | null;
+}
+
+export interface GeminiExtractionResponse {
+  result: GeminiExtractionResult;
+  metrics: GeminiCallMetrics;
 }
 
 const SYSTEM_PROMPT = `You are a construction drawing metadata extraction engine for an Australian document management platform called Tensi.
@@ -32,12 +53,13 @@ You will receive a JSON array of text elements extracted from a construction dra
 - "page_width": total page width in pixels
 - "page_height": total page height in pixels
 
-Your job is to extract exactly five fields from this drawing:
+Your job is to extract exactly six fields from this drawing:
 1. drawing_number
 2. drawing_title
 3. revision
 4. revision_date
 5. status
+6. location
 
 ---
 
@@ -108,6 +130,13 @@ STATUS
   Any text containing "MUST NOT BE COPIED"
   Scale references containing "@A"
 
+LOCATION
+- Extract the site address, project address, or building location for this drawing
+- Look for labels: Project Address, Site Address, Address, Location, Project Location, Site, Property
+- This is a physical street address or suburb/site name — e.g. "123 Main Street, Sydney NSW 2000" or "Corner of Park & King St, Melbourne"
+- Do NOT extract: project name, project number, client name, or architect address
+- If no address is found, return null
+
 CRITICAL: NEVER USE THESE AS FIELD VALUES
 - @A1, @A0, @A3, @A2 → these are scale notations
 - "REMIT VERSION" followed by a year → this is a file version, not a revision
@@ -133,18 +162,30 @@ Return confidence as 0.0–1.0 for each field:
 
 Set conflict_detected to true if title block revision ≠ revision block most recent revision.
 
+For field_coordinates: for each field, return the {x, y} pixel position of the text element where you found the value. Use the x/y from the input element array. If a field is null or not found, set its coordinate to null.
+
 {
   "drawing_number": "string | null",
   "drawing_title": "string | null",
   "revision": "string | null",
   "revision_date": "string | null",
   "status": "string | null",
+  "location": "string | null",
   "confidence": {
     "drawing_number": 0.0,
     "drawing_title": 0.0,
     "revision": 0.0,
     "revision_date": 0.0,
-    "status": 0.0
+    "status": 0.0,
+    "location": 0.0
+  },
+  "field_coordinates": {
+    "drawing_number": {"x": 0, "y": 0},
+    "drawing_title": {"x": 0, "y": 0},
+    "revision": {"x": 0, "y": 0},
+    "revision_date": {"x": 0, "y": 0},
+    "status": {"x": 0, "y": 0},
+    "location": {"x": 0, "y": 0}
   },
   "conflict_detected": false,
   "conflict_detail": "string | null",
@@ -160,10 +201,19 @@ function buildPrompt(templateContext: string): string {
   return SYSTEM_PROMPT.replace("{{TEMPLATE_CONTEXT}}", templateContext);
 }
 
+function extractUsage(response: { usageMetadata?: { promptTokenCount?: number; candidatesTokenCount?: number; thoughtsTokenCount?: number; totalTokenCount?: number } }): GeminiUsage {
+  const meta = response.usageMetadata ?? {};
+  const inputTokens    = meta.promptTokenCount      ?? 0;
+  const thinkingTokens = meta.thoughtsTokenCount    ?? 0;
+  const outputTokens   = Math.max(0, (meta.candidatesTokenCount ?? 0) - thinkingTokens);
+  const totalTokens    = meta.totalTokenCount        ?? (inputTokens + outputTokens + thinkingTokens);
+  return { inputTokens, outputTokens, thinkingTokens, totalTokens };
+}
+
 export async function extractWithGemini(
   elements: TextElement[],
   templateContext: string = ""
-): Promise<GeminiExtractionResult> {
+): Promise<GeminiExtractionResponse> {
   const apiKey = process.env.GOOGLE_GEMINI_API_KEY;
   if (!apiKey) throw new Error("GOOGLE_GEMINI_API_KEY not set");
 
@@ -176,20 +226,28 @@ export async function extractWithGemini(
   });
 
   const userMessage = JSON.stringify(elements, null, 2);
+  let retryCount = 0;
+  const t0 = Date.now();
 
   const result = await geminiModel.generateContent(userMessage);
   const text = result.response.text().trim();
-
-  // Strip markdown code fences if present
   const cleaned = text
     .replace(/^```(?:json)?\s*/i, "")
     .replace(/\s*```\s*$/i, "")
     .trim();
 
   try {
-    return JSON.parse(cleaned) as GeminiExtractionResult;
+    const parsed = JSON.parse(cleaned) as GeminiExtractionResult;
+    const usage = extractUsage(result.response);
+    const latencyMs = Date.now() - t0;
+    const costUsd = calculateCost(usage);
+    return {
+      result: parsed,
+      metrics: { usage, latencyMs, costUsd, retryCount, success: true },
+    };
   } catch {
     // Retry once with explicit instruction
+    retryCount = 1;
     const retryResult = await geminiModel.generateContent(
       `${userMessage}\n\nIMPORTANT: Return ONLY a valid JSON object. No markdown, no backticks, no explanation. Start your response with { and end with }`
     );
@@ -197,10 +255,31 @@ export async function extractWithGemini(
       .replace(/^```(?:json)?\s*/i, "")
       .replace(/\s*```\s*$/i, "")
       .trim();
+
+    const latencyMs = Date.now() - t0;
+
+    // Accumulate usage across both calls
+    const usage1 = extractUsage(result.response);
+    const usage2 = extractUsage(retryResult.response);
+    const usage: GeminiUsage = {
+      inputTokens:    usage1.inputTokens    + usage2.inputTokens,
+      outputTokens:   usage1.outputTokens   + usage2.outputTokens,
+      thinkingTokens: usage1.thinkingTokens + usage2.thinkingTokens,
+      totalTokens:    usage1.totalTokens    + usage2.totalTokens,
+    };
+    const costUsd = calculateCost(usage);
+
     try {
-      return JSON.parse(retryText) as GeminiExtractionResult;
+      const parsed = JSON.parse(retryText) as GeminiExtractionResult;
+      return {
+        result: parsed,
+        metrics: { usage, latencyMs, costUsd, retryCount, success: true },
+      };
     } catch {
-      throw new Error(`Gemini returned unparseable JSON: ${text.slice(0, 300)}`);
+      const errorMessage = `Gemini returned unparseable JSON: ${text.slice(0, 300)}`;
+      throw Object.assign(new Error(errorMessage), {
+        metrics: { usage, latencyMs, costUsd, retryCount, success: false, errorMessage },
+      });
     }
   }
 }

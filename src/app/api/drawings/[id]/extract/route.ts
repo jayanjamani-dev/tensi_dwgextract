@@ -5,25 +5,31 @@ import { detectCoverSheet } from "@/lib/cover-sheet";
 import { extractWithGemini } from "@/lib/gemini";
 import { validateExtraction } from "@/lib/validate-extraction";
 import { getTemplateContext } from "@/lib/templates";
+import type { GeminiCallMetrics } from "@/lib/api-metrics";
 
 export async function POST(
   _req: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
   const { id } = await params;
+  const pipelineStart = Date.now();
 
   const drawing = await prisma.drawing.findUnique({ where: { id } });
   if (!drawing) return NextResponse.json({ error: "Not found" }, { status: 404 });
 
-  // Mark as processing
   await prisma.drawing.update({
     where: { id },
     data: { extractionStatus: "processing" },
   });
 
   try {
-    // Step 1: Extract text via pdfplumber
-    const { elements, scanned, error: pdfError } = await extractTextFromPdf(drawing.filepath);
+    // Step 1: pdfplumber
+    const pdfStart = Date.now();
+    const { elements, scanned, error: pdfError } = await extractTextFromPdf(
+      drawing.filepath,
+      drawing.pageNumber
+    );
+    const pdfplumberTimeMs = Date.now() - pdfStart;
 
     if (pdfError) {
       await prisma.drawing.update({
@@ -32,6 +38,8 @@ export async function POST(
           extractionStatus: "extracted",
           flags: JSON.stringify(["PDF_EXTRACTION_ERROR"]),
           notes: pdfError,
+          pdfplumberTimeMs,
+          processingTimeMs: Date.now() - pipelineStart,
         },
       });
       return NextResponse.json({ error: pdfError }, { status: 500 });
@@ -52,23 +60,47 @@ export async function POST(
           pdfplumberRaw: JSON.stringify(elements),
           flags: JSON.stringify(flags),
           extractedAt: new Date(),
+          pdfplumberTimeMs,
+          processingTimeMs: Date.now() - pipelineStart,
         },
       });
-      return NextResponse.json({
-        status: isCoverSheet ? "cover_sheet" : "scanned",
-        flags,
-      });
+      return NextResponse.json({ status: isCoverSheet ? "cover_sheet" : "scanned", flags });
     }
 
-    // Step 3: Template context
+    // Step 3: Gemini extraction
     const templateContext = await getTemplateContext(drawing.architectId);
+    let geminiMetrics: GeminiCallMetrics | undefined;
 
-    // Step 4: Gemini extraction
     let geminiResult;
     try {
-      geminiResult = await extractWithGemini(elements, templateContext);
+      const response = await extractWithGemini(elements, templateContext);
+      geminiResult = response.result;
+      geminiMetrics = response.metrics;
     } catch (err) {
+      // Capture metrics even on failure
+      const errMetrics = (err as { metrics?: GeminiCallMetrics }).metrics;
       const errMsg = err instanceof Error ? err.message : String(err);
+
+      if (errMetrics) {
+        await prisma.apiCall.create({
+          data: {
+            drawingId: id,
+            model: process.env.GEMINI_MODEL || "gemini-2.5-flash",
+            callType: "extract",
+            inputTokens: errMetrics.usage.inputTokens,
+            outputTokens: errMetrics.usage.outputTokens,
+            thinkingTokens: errMetrics.usage.thinkingTokens,
+            totalTokens: errMetrics.usage.totalTokens,
+            latencyMs: errMetrics.latencyMs,
+            costUsd: errMetrics.costUsd,
+            success: false,
+            errorMessage: errMsg,
+            retryCount: errMetrics.retryCount,
+          },
+        });
+      }
+
+      const processingTimeMs = Date.now() - pipelineStart;
       await prisma.drawing.update({
         where: { id },
         data: {
@@ -77,16 +109,41 @@ export async function POST(
           flags: JSON.stringify(["GEMINI_PARSE_ERROR"]),
           notes: errMsg,
           extractedAt: new Date(),
+          pdfplumberTimeMs,
+          processingTimeMs,
+          totalInputTokens: errMetrics?.usage.inputTokens ?? 0,
+          totalOutputTokens: errMetrics?.usage.outputTokens ?? 0,
+          totalCostUsd: errMetrics?.costUsd ?? 0,
         },
       });
       return NextResponse.json({ error: errMsg }, { status: 500 });
     }
 
-    // Step 5: Validation
+    // Step 4: Validation
     const confidenceThreshold = parseFloat(process.env.CONFIDENCE_THRESHOLD || "0.7");
     const validated = validateExtraction(geminiResult, confidenceThreshold);
+    const processingTimeMs = Date.now() - pipelineStart;
 
-    // Step 6: Write to DB
+    // Persist ApiCall record
+    if (geminiMetrics) {
+      await prisma.apiCall.create({
+        data: {
+          drawingId: id,
+          model: process.env.GEMINI_MODEL || "gemini-2.5-flash",
+          callType: "extract",
+          inputTokens: geminiMetrics.usage.inputTokens,
+          outputTokens: geminiMetrics.usage.outputTokens,
+          thinkingTokens: geminiMetrics.usage.thinkingTokens,
+          totalTokens: geminiMetrics.usage.totalTokens,
+          latencyMs: geminiMetrics.latencyMs,
+          costUsd: geminiMetrics.costUsd,
+          success: true,
+          retryCount: geminiMetrics.retryCount,
+        },
+      });
+    }
+
+    // Step 5: Write to DB
     const updated = await prisma.drawing.update({
       where: { id },
       data: {
@@ -95,6 +152,8 @@ export async function POST(
         revision: validated.revision,
         revisionDate: validated.revisionDate,
         status: validated.status,
+        location: validated.location,
+        fieldCoordinates: validated.fieldCoordinates ? JSON.stringify(validated.fieldCoordinates) : null,
         confidenceDrawingNumber: validated.confidenceDrawingNumber,
         confidenceDrawingTitle: validated.confidenceDrawingTitle,
         confidenceRevision: validated.confidenceRevision,
@@ -111,6 +170,11 @@ export async function POST(
         notes: validated.notes,
         extractionStatus: "extracted",
         extractedAt: new Date(),
+        pdfplumberTimeMs,
+        processingTimeMs,
+        totalInputTokens: geminiMetrics?.usage.inputTokens ?? 0,
+        totalOutputTokens: geminiMetrics?.usage.outputTokens ?? 0,
+        totalCostUsd: geminiMetrics?.costUsd ?? 0,
       },
     });
 
@@ -123,6 +187,7 @@ export async function POST(
         extractionStatus: "extracted",
         flags: JSON.stringify(["EXTRACTION_ERROR"]),
         notes: errMsg,
+        processingTimeMs: Date.now() - pipelineStart,
       },
     });
     return NextResponse.json({ error: errMsg }, { status: 500 });
