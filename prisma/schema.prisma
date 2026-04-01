@@ -128,6 +128,9 @@ model Template {
   revisionColumnOrder   String?   // JSON array e.g. ["rev","date","description","by"]
   revisionReadingDirection String? // top-to-bottom | bottom-to-top
   fieldLabelMap         String?   // JSON object mapping discovered labels to canonical names
+  titleBlockPattern     String?   // JSON: {side, bbox:{x0,y0,x1,y1}, confirmedDrawingCount, architectFirmName, drawingNumberFormat}
+  fieldPositions        String?   // JSON object mapping fields to {x,y} exact coordinates
+  valueReplacements     String?   // JSON object storing correction history { fieldName: { originalValue: correctedValue } }
   sampleDrawingId       String?
   lastUpdated           DateTime  @default(now())
 }

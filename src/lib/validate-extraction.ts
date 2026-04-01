@@ -67,36 +67,46 @@ function normaliseStatus(raw: string | null): string | null {
 function normaliseDate(raw: string | null): { value: string | null; confidence?: number; flagged: boolean } {
   if (!raw) return { value: null, flagged: false };
 
-  const cleaned = raw.trim();
+  const cleaned = raw.trim().replace(/_/g, "-").replace(/\\/g, "/");
 
   // Already DD/MM/YYYY
-  if (/^\d{2}\/\d{2}\/\d{4}$/.test(cleaned)) return { value: cleaned, flagged: false };
+  if (/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/.test(cleaned)) {
+    const m = cleaned.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+    if (m) return { value: `${m[1].padStart(2, "0")}/${m[2].padStart(2, "0")}/${m[3]}`, flagged: false };
+  }
 
   // DD/MM/YY → assume 2000s
-  const dmyShort = cleaned.match(/^(\d{2})\/(\d{2})\/(\d{2})$/);
-  if (dmyShort) return { value: `${dmyShort[1]}/${dmyShort[2]}/20${dmyShort[3]}`, flagged: false };
+  const dmyShort = cleaned.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2})$/);
+  if (dmyShort) return { value: `${dmyShort[1].padStart(2, "0")}/${dmyShort[2].padStart(2, "0")}/20${dmyShort[3]}`, flagged: false };
 
   // DD.MM.YY or DD.MM.YYYY
-  const dotFormat = cleaned.match(/^(\d{2})\.(\d{2})\.(\d{2,4})$/);
+  const dotFormat = cleaned.match(/^(\d{1,2})\.(\d{1,2})\.(\d{2,4})$/);
   if (dotFormat) {
     const year = dotFormat[3].length === 2 ? `20${dotFormat[3]}` : dotFormat[3];
-    return { value: `${dotFormat[1]}/${dotFormat[2]}/${year}`, flagged: false };
+    return { value: `${dotFormat[1].padStart(2, "0")}/${dotFormat[2].padStart(2, "0")}/${year}`, flagged: false };
   }
 
   // DD-MM-YYYY or DD-MM-YY
-  const dashFormat = cleaned.match(/^(\d{2})-(\d{2})-(\d{2,4})$/);
+  const dashFormat = cleaned.match(/^(\d{1,2})-(\d{1,2})-(\d{2,4})$/);
   if (dashFormat) {
     const year = dashFormat[3].length === 2 ? `20${dashFormat[3]}` : dashFormat[3];
-    return { value: `${dashFormat[1]}/${dashFormat[2]}/${year}`, flagged: false };
+    return { value: `${dashFormat[1].padStart(2, "0")}/${dashFormat[2].padStart(2, "0")}/${year}`, flagged: false };
+  }
+
+  // YYYY-MM-DD or YYYY.MM.DD or YYYY/MM/DD
+  const isoFormat = cleaned.match(/^(\d{4})[-./](\d{1,2})[-./](\d{1,2})$/);
+  if (isoFormat) {
+    return { value: `${isoFormat[3].padStart(2, "0")}/${isoFormat[2].padStart(2, "0")}/${isoFormat[1]}`, flagged: false };
   }
 
   // DD/MM only (no year)
-  if (/^\d{2}\/\d{2}$/.test(cleaned)) {
-    return { value: cleaned, confidence: 0.6, flagged: false };
+  if (/^(\d{1,2})\/(\d{1,2})$/.test(cleaned)) {
+    const m = cleaned.match(/^(\d{1,2})\/(\d{1,2})$/);
+    if (m) return { value: `${m[1].padStart(2, "0")}/${m[2].padStart(2, "0")}`, confidence: 0.6, flagged: false };
   }
 
-  // Month YY (e.g. "Nov 25", "FEB 2026", "NOV 24")
-  const monthYear = cleaned.match(/^([A-Za-z]+)\s+(\d{2,4})$/);
+  // Month YY (e.g. "Nov 25", "FEB 2026", "NOV 24", "Nov-25")
+  const monthYear = cleaned.match(/^([A-Za-z]+)[\s-]+(\d{2,4})$/);
   if (monthYear) {
     const monthMap: Record<string, string> = {
       jan: "01", feb: "02", mar: "03", apr: "04", may: "05", jun: "06",
@@ -119,7 +129,12 @@ function normaliseDate(raw: string | null): { value: string | null; confidence?:
     return { value: `${dd}/${mm}/${yyyy}`, flagged: false };
   }
 
-  // Unparseable — return raw and flag
+  // Unparseable — strip alpha characters to get base date, but flag it
+  const numericData = cleaned.replace(/[^0-9/.-]/g, "");
+  if (numericData.length >= 6) {
+    return { value: numericData, confidence: 0.4, flagged: true };
+  }
+
   return { value: cleaned, flagged: true };
 }
 

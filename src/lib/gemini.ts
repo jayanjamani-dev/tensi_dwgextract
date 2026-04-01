@@ -1,6 +1,7 @@
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import { TextElement } from "./pdfplumber";
 import { GeminiUsage, GeminiCallMetrics, calculateCost } from "./api-metrics";
+import { generateTerminologyPromptContext } from "./terminology";
 
 export interface FieldCoordinate {
   x: number;
@@ -112,10 +113,11 @@ REVISION DATE
 - Do not use the title block's general "Date" or "Date Drawn" field — that is the original drawing date, not the revision date
 
 STATUS
-- Check three locations in this priority order:
-  1. Large font-size text anywhere on the page matching known status vocabulary (font size larger than body text)
-  2. A dedicated field in the title block labelled: Status, Drawing Status, Issue Status, Issued For
-  3. The description/amendment column of the most recent revision row
+- RULES FOR EXTRACTING 'STATUS':
+  1. ALWAYS search the revision block FIRST. Identify the MOST RECENT/HIGHEST revision entry in chronological order (whether numeric like '02' or alphanumeric like 'C'). 
+  2. Use the status explicitly associated with that highest revision entry (e.g. 'FOR CONSTRUCTION', 'TENDER').
+  3. Only if the revision block is entirely empty or missing, fall back to extracting the status or 'purpose of issue' from the main title block. 
+  4. Do not guess. If no explicit status is found anywhere, return null.
 - Known status vocabulary to match against:
   Preliminary Issue, Preliminary, Tender Issue, For Tender, Tender Documentation, Tender Review,
   Construction Issue, Issued for Construction, For Construction,
@@ -195,10 +197,15 @@ For field_coordinates: for each field, return the {x, y} pixel position of the t
   "notes": "string | null"
 }
 
+{{TERMINOLOGY_CONTEXT}}
+
 {{TEMPLATE_CONTEXT}}`;
 
 function buildPrompt(templateContext: string): string {
-  return SYSTEM_PROMPT.replace("{{TEMPLATE_CONTEXT}}", templateContext);
+  const terminology = generateTerminologyPromptContext();
+  return SYSTEM_PROMPT
+    .replace("{{TERMINOLOGY_CONTEXT}}", terminology)
+    .replace("{{TEMPLATE_CONTEXT}}", templateContext);
 }
 
 function extractUsage(response: { usageMetadata?: { promptTokenCount?: number; candidatesTokenCount?: number; thoughtsTokenCount?: number; totalTokenCount?: number } }): GeminiUsage {

@@ -14,7 +14,7 @@ export const metadata: Metadata = {
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
     <html lang="en" className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}>
-      <body className="min-h-full flex flex-col bg-gray-50 text-gray-900">
+      <body className="min-h-full flex flex-col bg-gray-50 text-gray-900" suppressHydrationWarning>
         <nav className="bg-white border-b border-gray-200 px-6 py-3 flex items-center gap-6 shrink-0">
           <Link href="/" className="font-semibold text-gray-900 text-lg tracking-tight">
             Tensi
@@ -24,6 +24,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
             <Link href="/templates" className="text-gray-600 hover:text-gray-900">Templates</Link>
             <Link href="/stats" className="text-gray-600 hover:text-gray-900">Stats</Link>
             <Link href="/finops" className="text-gray-600 hover:text-gray-900">FinOps</Link>
+            <Link href="/rules" className="text-gray-600 hover:text-gray-900">Rules</Link>
             <Link href="/settings" className="text-gray-600 hover:text-gray-900">Settings</Link>
           </div>
         </nav>

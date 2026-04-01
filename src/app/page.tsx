@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 
 interface Project {
   id: string;
@@ -19,6 +20,12 @@ export default function HomePage() {
   const [newName, setNewName] = useState("");
   const [newDesc, setNewDesc] = useState("");
   const [showForm, setShowForm] = useState(false);
+  const router = useRouter();
+
+  async function deleteProject(projectId: string) {
+    await fetch(`/api/projects/${projectId}`, { method: "DELETE" });
+    load();
+  }
 
   async function load() {
     const res = await fetch("/api/projects");
@@ -128,7 +135,16 @@ export default function HomePage() {
                     <div className="font-medium">{p.name}</div>
                     {p.description && <div className="text-sm text-gray-500 mt-0.5">{p.description}</div>}
                   </div>
-                  <div className="text-sm text-gray-400">{p._count.drawings} drawing{p._count.drawings !== 1 ? "s" : ""}</div>
+                  <div className="flex items-center gap-3">
+                    <div className="text-sm text-gray-400">{p._count.drawings} drawing{p._count.drawings !== 1 ? "s" : ""}</div>
+                    <button
+                      onClick={(e) => { e.preventDefault(); e.stopPropagation(); deleteProject(p.id); }}
+                      className="text-xs text-red-400 hover:text-red-600 px-1.5 py-0.5 rounded hover:bg-red-50"
+                      title="Delete project"
+                    >
+                      ✕
+                    </button>
+                  </div>
                 </div>
                 {p.drawings.length > 0 && (
                   <div className="flex flex-wrap gap-1.5 mt-3">
