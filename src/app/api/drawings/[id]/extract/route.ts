@@ -15,6 +15,7 @@ import {
   getProjectConfirmedSide,
   TitleBlockPattern,
   TitleBlockBbox,
+  resolveArchitectAndLearnTemplate,
 } from "@/lib/templates";
 import type { GeminiCallMetrics } from "@/lib/api-metrics";
 
@@ -226,7 +227,7 @@ export async function POST(
 
     // ── Step 4: Validation ────────────────────────────────────────
     const confidenceThreshold = parseFloat(process.env.CONFIDENCE_THRESHOLD || "0.7");
-    const validated = validateExtraction(geminiResult, confidenceThreshold);
+    const validated = await validateExtraction(geminiResult, confidenceThreshold);
     const processingTimeMs = Date.now() - pipelineStart;
 
     // Merge pipeline flags into validated flags
@@ -251,83 +252,29 @@ export async function POST(
       });
     }
 
-    // ── Step 5: Template Learning ─────────────────────────────────
-    if (drawing.architectId && validated.drawingNumber) {
-      const architectId = drawing.architectId;
-
-      if (cropMode) {
-        // Already using a confirmed pattern — increment count
-        await incrementPatternConfirmation(architectId);
-        allFlags.push("PATTERN_CONFIRMED");
-      } else {
-        // Region mode — learn from this drawing
-        const currentPattern = await getTemplatePattern(architectId);
-        const extractedCount = await getProjectExtractedCount(drawing.project.id);
-
-        const side = validated.titleBlockLocation === "right" ? "right" as const : "bottom" as const;
-        const drawingNumberFormat = inferDrawingNumberFormat(validated.drawingNumber);
-
-        // Filter out null field coordinates
-        const cleanFieldPositions: Record<string, { x: number; y: number }> = {};
-        if (validated.fieldCoordinates) {
-          for (const [key, value] of Object.entries(validated.fieldCoordinates)) {
-            if (value) cleanFieldPositions[key] = value;
-          }
-        }
-
-        if (!currentPattern) {
-          // First drawing from this architect — create candidate pattern
-          const regionBbox = side === "bottom"
-            ? { x0: 0, y0: (elements[0]?.page_height ?? 842) * 0.75, x1: elements[0]?.page_width ?? 595, y1: elements[0]?.page_height ?? 842 }
-            : { x0: (elements[0]?.page_width ?? 595) * 0.70, y0: 0, x1: elements[0]?.page_width ?? 595, y1: elements[0]?.page_height ?? 842 };
-
-          const newPattern: TitleBlockPattern = {
-            side,
-            bbox: regionBbox,
-            confirmedDrawingCount: 1,
-            architectFirmName: drawing.architect?.firmName ?? "Unknown",
-            projectName: drawing.project.name,
-            drawingNumberFormat: drawingNumberFormat ?? undefined,
-          };
-
-          await saveTemplatePattern(
-            architectId,
-            newPattern,
-            validated.titleBlockLocation,
-            validated.revisionBlockLocation,
-            Object.keys(cleanFieldPositions).length > 0 ? cleanFieldPositions : null
-          );
-        } else if (currentPattern.confirmedDrawingCount < PATTERN_LOCK_THRESHOLD) {
-          // Building confidence — check if this drawing agrees with the prior pattern
-          if (currentPattern.side === side) {
-            currentPattern.confirmedDrawingCount += 1;
-            // Merge drawing number format if first one was missing
-            if (!currentPattern.drawingNumberFormat && drawingNumberFormat) {
-              currentPattern.drawingNumberFormat = drawingNumberFormat;
-            }
-            await saveTemplatePattern(
-              architectId,
-              currentPattern,
-              validated.titleBlockLocation,
-              validated.revisionBlockLocation,
-              Object.keys(cleanFieldPositions).length > 0 ? cleanFieldPositions : null
-            );
-
-            if (currentPattern.confirmedDrawingCount >= PATTERN_LOCK_THRESHOLD) {
-              allFlags.push("PATTERN_LOCKED");
-            }
-          }
-          // If sides disagree, leave the pattern as-is — more data needed
-        } else {
-          // Pattern already locked but we're not in crop mode (e.g. new project, mismatch fallback)
-          // Just increment if the side matches
-          if (currentPattern.side === side) {
-            await incrementPatternConfirmation(architectId);
-            allFlags.push("PATTERN_CONFIRMED");
-          }
-        }
+    // ── Step 5: Architect Resolution + Template Learning ──────────
+    const cleanFieldPositions: Record<string, { x: number; y: number }> = {};
+    if (validated.fieldCoordinates) {
+      for (const [key, value] of Object.entries(validated.fieldCoordinates)) {
+        if (value) cleanFieldPositions[key] = value;
       }
     }
+
+    const templateResult = await resolveArchitectAndLearnTemplate({
+      drawingId: id,
+      drawingNumber: validated.drawingNumber,
+      titleBlockLocation: validated.titleBlockLocation,
+      revisionBlockLocation: validated.revisionBlockLocation,
+      fieldCoordinates: Object.keys(cleanFieldPositions).length > 0 ? cleanFieldPositions : null,
+      elements,
+      projectId: drawing.project.id,
+      projectName: drawing.project.name,
+      existingArchitectId: drawing.architectId,
+      geminiArchitectFirmName: geminiResult.architect_firm_name,
+    });
+
+    const finalFlags = [...new Set([...allFlags, ...templateResult.flags])];
+    console.log(`[extract] ${drawing.filename}: template=${templateResult.log.join(' | ')}`);
 
     // ── Step 6: Write to DB ───────────────────────────────────────
     const updated = await prisma.drawing.update({
@@ -352,7 +299,7 @@ export async function POST(
         revisionBlockLocation: validated.revisionBlockLocation,
         extractionModel: process.env.GEMINI_MODEL || "gemini-2.5-flash",
         pdfplumberRaw: JSON.stringify(elements),
-        flags: JSON.stringify(allFlags),
+        flags: JSON.stringify(finalFlags),
         notes: validated.notes,
         extractionStatus: "extracted",
         extractedAt: new Date(),

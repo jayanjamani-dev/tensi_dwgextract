@@ -4,6 +4,7 @@ import { useEffect, useRef, useState, useCallback } from "react";
 import { useParams, useRouter } from "next/navigation";
 import Link from "next/link";
 import dynamic from "next/dynamic";
+import { BrainCircuit, Sparkles } from "lucide-react";
 
 const PDFViewer = dynamic(() => import("@/components/PDFViewer"), { ssr: false });
 
@@ -434,6 +435,7 @@ export default function ProjectPage() {
     corrected: string;
     affectedIds: string[];
     count: number;
+    isGlobal?: boolean;
   } | null>(null);
 
   const load = useCallback(async () => {
@@ -808,40 +810,63 @@ export default function ProjectPage() {
       {/* Batch Correction Modal */}
       {pendingBatchCorrection && (
         <div className="fixed inset-0 z-[60] flex items-center justify-center p-4">
-          <div className="absolute inset-0 bg-gray-900/40" onClick={() => setPendingBatchCorrection(null)} />
-          <div className="relative bg-white rounded-xl shadow-xl w-full max-w-md overflow-hidden animate-slide-up">
-            <div className="p-6">
-              <h3 className="text-lg font-semibold text-gray-900 mb-2">Apply Correction to Project?</h3>
-              <p className="text-sm text-gray-600 mb-4">
-                This error was found in <strong className="text-gray-900">{pendingBatchCorrection.count} other drawing{pendingBatchCorrection.count !== 1 ? 's' : ''}</strong> in this set. Apply this correction to all of them?
-              </p>
-              
-              <div className="bg-gray-50 border border-gray-100 rounded-lg p-3 text-sm grid grid-cols-2 mb-6">
-                <div>
-                  <div className="text-xs text-red-500 font-medium uppercase tracking-wide mb-1">Original</div>
-                  <div className="line-through text-gray-500">{pendingBatchCorrection.original || "—"}</div>
+          <div className="absolute inset-0 bg-gray-900/60 backdrop-blur-sm" onClick={() => setPendingBatchCorrection(null)} />
+          <div className="relative bg-white rounded-2xl shadow-2xl w-full max-w-md overflow-hidden animate-slide-up border border-gray-100">
+            <div className="p-8">
+              <div className="flex items-center gap-3 mb-6">
+                <div className={`w-12 h-12 rounded-xl flex items-center justify-center ${pendingBatchCorrection.isGlobal ? "bg-fuchsia-100 text-fuchsia-600" : "bg-blue-100 text-blue-600"}`}>
+                  <BrainCircuit className="w-6 h-6" />
                 </div>
                 <div>
-                  <div className="text-xs text-green-600 font-medium uppercase tracking-wide mb-1">Corrected</div>
-                  <div className="text-gray-900 font-medium">{pendingBatchCorrection.corrected || "—"}</div>
+                  <h3 className="text-xl font-bold text-gray-900">Intelligence Detected</h3>
+                  <p className="text-xs text-gray-400 font-medium uppercase tracking-wider mt-0.5">
+                    {pendingBatchCorrection.isGlobal ? "Architect-Global Pattern" : "Project-Local Inconsistency"}
+                  </p>
                 </div>
               </div>
 
-              <div className="flex gap-3 justify-end">
-                <button
-                  onClick={() => setPendingBatchCorrection(null)}
-                  className="px-4 py-2 text-sm text-gray-700 hover:bg-gray-100 font-medium rounded-lg"
-                >
-                  No, just this one
-                </button>
+              <p className="text-sm text-gray-600 mb-6 leading-relaxed">
+                This correction matches <strong className="text-gray-900">{pendingBatchCorrection.count} other drawing{pendingBatchCorrection.count !== 1 ? 's' : ''}</strong> 
+                {pendingBatchCorrection.isGlobal ? " across all projects for this architect." : " in this project."} 
+                Apply this rule automatically?
+              </p>
+              
+              <div className="bg-gray-50/80 border border-gray-100 rounded-2xl p-5 grid grid-cols-1 gap-4 mb-8">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <div className="text-[10px] text-gray-400 font-bold uppercase tracking-widest mb-1">Extracted</div>
+                    <div className="line-through text-gray-400 font-mono text-sm">{pendingBatchCorrection.original || "—"}</div>
+                  </div>
+                  <div className="w-8 h-8 flex items-center justify-center text-gray-300">→</div>
+                  <div className="text-right">
+                    <div className="text-[10px] text-blue-500 font-bold uppercase tracking-widest mb-1">Corrected</div>
+                    <div className="text-gray-900 font-bold font-mono text-sm">{pendingBatchCorrection.corrected || "—"}</div>
+                  </div>
+                </div>
+              </div>
+
+              <div className="flex flex-col gap-3">
                 <button
                   onClick={applyBatchCorrection}
-                  className="px-4 py-2 text-sm text-white bg-blue-600 hover:bg-blue-700 font-medium rounded-lg shadow-sm"
+                  className={`w-full py-3 text-sm font-bold text-white rounded-xl shadow-lg shadow-blue-500/20 transition-all active:scale-[0.98] ${pendingBatchCorrection.isGlobal ? "bg-fuchsia-600 hover:bg-fuchsia-700" : "bg-blue-600 hover:bg-blue-700"}`}
                 >
-                  Yes, apply to all {pendingBatchCorrection.count}
+                  Yes, Update All {pendingBatchCorrection.count} Drawings
+                </button>
+                <button
+                  onClick={() => setPendingBatchCorrection(null)}
+                  className="w-full py-3 text-sm text-gray-500 hover:text-gray-700 font-semibold rounded-xl hover:bg-gray-100 transition-all"
+                >
+                  No, only correct this one
                 </button>
               </div>
             </div>
+            
+            {pendingBatchCorrection.isGlobal && (
+              <div className="bg-fuchsia-50 px-8 py-3 border-t border-fuchsia-100 flex items-center justify-center gap-2">
+                <Sparkles className="w-3.5 h-3.5 text-fuchsia-500" />
+                <span className="text-[10px] font-bold text-fuchsia-700 uppercase tracking-tighter">Reinforcing architect template for future extractions</span>
+              </div>
+            )}
           </div>
         </div>
       )}

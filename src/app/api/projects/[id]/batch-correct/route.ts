@@ -15,7 +15,7 @@ export async function POST(
 
   // 1. Fetch current drawings to create correction logs
   const drawings = await prisma.drawing.findMany({
-    where: { projectId: id, id: { in: ids } },
+    where: { id: { in: ids } },
     select: { id: true, [fieldName]: true }
   });
 
@@ -28,7 +28,7 @@ export async function POST(
 
   // 2. Batch update drawings
   await prisma.drawing.updateMany({
-    where: { projectId: id, id: { in: ids } },
+    where: { id: { in: ids } },
     data: { [fieldName]: correctedValue }
   });
 

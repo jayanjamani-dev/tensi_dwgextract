@@ -31,37 +31,25 @@ export interface ValidationResult {
   notes: string | null;
 }
 
-const STATUS_NORMALISATION: Record<string, string> = {
-  "preliminary issue": "Preliminary Issue",
-  "preliminary": "Preliminary Issue",
-  "prelim": "Preliminary Issue",
-  "tender issue": "Tender Issue",
-  "for tender": "Tender Issue",
-  "tender documentation": "Tender Issue",
-  "tender review": "Tender Issue",
-  "construction issue": "Construction Issue",
-  "issued for construction": "Construction Issue",
-  "for construction": "Construction Issue",
-  "construction": "Construction Issue",
-  "for pricing": "For Pricing",
-  "not for construction": "Not for Construction",
-  "for building approval": "For Building Approval",
-  "bpa": "For Building Approval",
-  "building permit issue": "For Building Approval",
-  "for review": "For Review",
-  "for comment": "For Review",
-  "coordination issue": "Coordination Issue",
-  "design development": "Design Development",
-  "superseded": "Superseded",
-  "cancelled": "Cancelled",
-  "void": "Cancelled",
-  "drawing issue": "Construction Issue",
-};
+import { prisma } from "./db";
 
-function normaliseStatus(raw: string | null): string | null {
+async function getStatusNormalisationRules(): Promise<Record<string, string>> {
+  const rule = await prisma.systemRule.findUnique({
+    where: { ruleType: "STATUS_NORMALISATION" },
+  });
+  if (!rule) return {};
+  try {
+    return JSON.parse(rule.content);
+  } catch {
+    return {};
+  }
+}
+
+async function normaliseStatus(raw: string | null): Promise<string | null> {
   if (!raw) return null;
   const key = raw.toLowerCase().trim();
-  return STATUS_NORMALISATION[key] ?? raw;
+  const rules = await getStatusNormalisationRules();
+  return rules[key] ?? raw;
 }
 
 function normaliseDate(raw: string | null): { value: string | null; confidence?: number; flagged: boolean } {
@@ -156,10 +144,10 @@ function cleanDrawingNumber(
   return { drawingNumber: drawingNumber.trim(), revision };
 }
 
-export function validateExtraction(
+export async function validateExtraction(
   raw: GeminiExtractionResult,
   confidenceThreshold: number = 0.7
-): ValidationResult {
+): Promise<ValidationResult> {
   const flags: string[] = [];
 
   // Drawing number cleanup
@@ -219,7 +207,7 @@ export function validateExtraction(
   if (!revision && !revisionDate) flags.push("NEEDS_REVIEW");
 
   // Status normalisation
-  const status = normaliseStatus(raw.status);
+  const status = await normaliseStatus(raw.status);
 
   return {
     drawingNumber,

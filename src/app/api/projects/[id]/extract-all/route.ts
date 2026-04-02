@@ -1,10 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/db";
-import { extractTextFromPdf } from "@/lib/pdfplumber";
+import { extractTextFromPdf, TextElement } from "@/lib/pdfplumber";
 import { detectCoverSheet } from "@/lib/cover-sheet";
 import { extractWithGemini } from "@/lib/gemini";
 import { validateExtraction } from "@/lib/validate-extraction";
-import { getTemplateContext } from "@/lib/templates";
+import { getTemplateContext, resolveArchitectAndLearnTemplate } from "@/lib/templates";
 import type { GeminiCallMetrics } from "@/lib/api-metrics";
 
 // Paid tier: ~1000 RPM. Free tier: 20 RPM (set GEMINI_RATE_DELAY_MS=3500).
@@ -19,6 +19,9 @@ export async function POST(
   { params }: { params: Promise<{ id: string }> }
 ) {
   const { id: projectId } = await params;
+
+  const project = await prisma.project.findUnique({ where: { id: projectId }, select: { id: true, name: true } });
+  if (!project) return NextResponse.json({ error: "Project not found" }, { status: 404 });
 
   const drawings = await prisma.drawing.findMany({
     where: { projectId, extractionStatus: "pending" },
@@ -44,10 +47,11 @@ export async function POST(
     try {
       // Step 1: pdfplumber
       const pdfStart = Date.now();
-      const { elements, scanned, error: pdfError } = await extractTextFromPdf(
-        drawing.filepath,
-        drawing.pageNumber
-      );
+      let elements: TextElement[] = [];
+      const pdfResult = await extractTextFromPdf(drawing.filepath, drawing.pageNumber);
+      elements = pdfResult.elements;
+      const scanned = pdfResult.scanned;
+      const pdfError = pdfResult.error;
       const pdfplumberTimeMs = Date.now() - pdfStart;
 
       if (pdfError) {
@@ -144,8 +148,32 @@ export async function POST(
       }
 
       // Step 5: Validation
-      const validated = validateExtraction(geminiResult, confidenceThreshold);
+      const validated = await validateExtraction(geminiResult, confidenceThreshold);
       const processingTimeMs = Date.now() - pipelineStart;
+
+      // Step 6: Architect resolution + template learning
+      const cleanFieldPositions: Record<string, { x: number; y: number }> = {};
+      if (validated.fieldCoordinates) {
+        for (const [key, value] of Object.entries(validated.fieldCoordinates)) {
+          if (value) cleanFieldPositions[key] = value;
+        }
+      }
+
+      const templateResult = await resolveArchitectAndLearnTemplate({
+        drawingId: drawing.id,
+        drawingNumber: validated.drawingNumber,
+        titleBlockLocation: validated.titleBlockLocation,
+        revisionBlockLocation: validated.revisionBlockLocation,
+        fieldCoordinates: Object.keys(cleanFieldPositions).length > 0 ? cleanFieldPositions : null,
+        elements,
+        projectId,
+        projectName: project.name,
+        existingArchitectId: drawing.architectId,
+        geminiArchitectFirmName: geminiResult.architect_firm_name,
+      });
+
+      const allFlags = [...new Set([...validated.flags, ...templateResult.flags])];
+      console.log(`[extract-all] ${drawing.filename} p${drawing.pageNumber}: template=${templateResult.log.join(' | ')}`);
 
       // Persist ApiCall record
       if (geminiMetrics) {
@@ -188,7 +216,7 @@ export async function POST(
           revisionBlockLocation: validated.revisionBlockLocation,
           extractionModel: process.env.GEMINI_MODEL || "gemini-2.5-flash",
           pdfplumberRaw: JSON.stringify(elements),
-          flags: JSON.stringify(validated.flags),
+          flags: JSON.stringify(allFlags),
           notes: validated.notes,
           extractionStatus: "extracted",
           extractedAt: new Date(),
@@ -200,7 +228,7 @@ export async function POST(
         },
       });
 
-      results.push({ id: drawing.id, filename: drawing.filename, page: drawing.pageNumber, status: "extracted", flags: validated.flags });
+      results.push({ id: drawing.id, filename: drawing.filename, page: drawing.pageNumber, status: "extracted", flags: allFlags });
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
       await prisma.drawing.update({

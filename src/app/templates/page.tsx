@@ -1,6 +1,20 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { 
+  Building2, 
+  Layout, 
+  BrainCircuit, 
+  ExternalLink, 
+  Save, 
+  Clock, 
+  Search,
+  CheckCircle2,
+  AlertCircle,
+  FileJson,
+  ChevronRight,
+  Sparkles
+} from "lucide-react";
 
 interface Template {
   id: string;
@@ -10,39 +24,60 @@ interface Template {
   revisionColumnOrder: string | null;
   revisionReadingDirection: string | null;
   fieldLabelMap: string | null;
+  valueReplacements: string | null;
+  learnedRules: string | null;
   lastUpdated: string;
   architect: { firmName: string; firmAddress: string | null };
 }
 
-function JsonEditor({ value, onChange }: { value: string | null; onChange: (v: string) => void }) {
+function JsonEditor({ value, onChange, label }: { value: string | null; onChange: (v: string) => void; label: string }) {
   const [raw, setRaw] = useState(value || "{}");
   const [valid, setValid] = useState(true);
 
+  useEffect(() => {
+    setRaw(value || "{}");
+  }, [value]);
+
   function handleChange(v: string) {
     setRaw(v);
-    try { JSON.parse(v); setValid(true); onChange(v); } catch { setValid(false); }
+    try { 
+      JSON.parse(v); 
+      setValid(true); 
+      onChange(v); 
+    } catch { 
+      setValid(false); 
+    }
   }
 
   return (
-    <textarea
-      value={raw}
-      onChange={(e) => handleChange(e.target.value)}
-      rows={4}
-      className={`w-full font-mono text-xs border rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-gray-900 ${valid ? "border-gray-200" : "border-red-400"}`}
-    />
+    <div className="space-y-1.5">
+      <div className="flex items-center justify-between">
+        <label className="text-[10px] font-bold text-gray-400 uppercase tracking-wider">{label}</label>
+        {!valid && <span className="text-[10px] text-red-500 font-medium flex items-center gap-1"><AlertCircle className="w-2.5 h-2.5" /> Invalid JSON</span>}
+      </div>
+      <textarea
+        value={raw}
+        onChange={(e) => handleChange(e.target.value)}
+        rows={4}
+        className={`w-full font-mono text-[11px] border rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500 bg-gray-50 transition-all ${valid ? "border-gray-200" : "border-red-300"}`}
+      />
+    </div>
   );
 }
 
 export default function TemplatesPage() {
   const [templates, setTemplates] = useState<Template[]>([]);
   const [loading, setLoading] = useState(true);
-  const [expanded, setExpanded] = useState<string | null>(null);
+  const [search, setSearch] = useState("");
+  const [editingId, setEditingId] = useState<string | null>(null);
   const [edits, setEdits] = useState<Record<string, Partial<Template>>>({});
   const [saving, setSaving] = useState<string | null>(null);
 
   async function load() {
+    setLoading(true);
     const res = await fetch("/api/templates");
-    setTemplates(await res.json());
+    const data = await res.json();
+    setTemplates(data);
     setLoading(false);
   }
 
@@ -60,119 +95,262 @@ export default function TemplatesPage() {
       body: JSON.stringify(edits[id] || {}),
     });
     setSaving(null);
+    setEditingId(null);
     load();
   }
 
-  if (loading) return <div className="p-8 text-gray-500">Loading…</div>;
+  const filtered = templates.filter(t => 
+    t.architect.firmName.toLowerCase().includes(search.toLowerCase()) ||
+    t.id.toLowerCase().includes(search.toLowerCase())
+  );
+
+  if (loading && templates.length === 0) {
+    return (
+      <div className="max-w-7xl mx-auto px-6 py-12 flex flex-col items-center justify-center min-h-[60vh]">
+        <div className="w-12 h-12 border-4 border-blue-500/20 border-t-blue-500 rounded-full animate-spin mb-4" />
+        <p className="text-gray-500 font-medium animate-pulse">Synchronizing Intelligence...</p>
+      </div>
+    );
+  }
 
   return (
-    <div className="max-w-3xl mx-auto p-8">
-      <h1 className="text-2xl font-semibold mb-2">Template Library</h1>
-      <p className="text-sm text-gray-500 mb-6">Stored patterns per architect firm. Used to guide Gemini extraction on known templates.</p>
+    <div className="max-w-7xl mx-auto px-6 py-10">
+      {/* Header Section */}
+      <div className="flex flex-col md:flex-row md:items-center justify-between gap-6 mb-10">
+        <div>
+          <h1 className="text-3xl font-bold text-gray-900 tracking-tight flex items-center gap-3">
+            <Layout className="w-8 h-8 text-blue-600" />
+            Architect Intelligence Library
+          </h1>
+          <p className="text-gray-500 mt-2 max-w-2xl">
+            Central repository of structural patterns and learned terminology mappings. 
+            Rules are automatically extracted from user corrections to reinforce parsing accuracy.
+          </p>
+        </div>
+
+        <div className="relative group">
+          <Search className="w-4 h-4 text-gray-400 absolute left-3 top-1/2 -translate-y-1/2 group-focus-within:text-blue-500 transition-colors" />
+          <input 
+            type="text" 
+            placeholder="Search architects or firms..." 
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            className="pl-10 pr-4 py-2.5 border border-gray-200 rounded-xl text-sm w-full md:w-72 focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 transition-all shadow-sm"
+          />
+        </div>
+      </div>
 
       {templates.length === 0 ? (
-        <div className="text-center py-12 text-gray-400">No templates yet. They are created automatically when drawings are extracted.</div>
+        <div className="bg-white border border-gray-200 rounded-2xl p-16 text-center shadow-sm">
+          <div className="w-20 h-20 bg-gray-50 rounded-full flex items-center justify-center mx-auto mb-6">
+            <Sparkles className="w-10 h-10 text-gray-300" />
+          </div>
+          <h3 className="text-xl font-semibold text-gray-800">Intelligence Engine Dormant</h3>
+          <p className="text-gray-500 mt-2 max-w-sm mx-auto">
+            Templates are generated automatically upon successful drawing extraction.
+            Correction maps will appear here as the system learns your preferences.
+          </p>
+        </div>
       ) : (
-        <div className="flex flex-col gap-3">
-          {templates.map((t) => {
-            const isExpanded = expanded === t.id;
-            const edit = edits[t.id] || {};
+        <div className="bg-white border border-gray-200 rounded-2xl shadow-sm overflow-hidden border-separate">
+          <table className="w-full text-left border-collapse">
+            <thead>
+              <tr className="bg-gray-50/50 border-b border-gray-100">
+                <th className="px-6 py-4 text-[11px] font-bold text-gray-400 uppercase tracking-widest">Architect Firm</th>
+                <th className="px-6 py-4 text-[11px] font-bold text-gray-400 uppercase tracking-widest">Structural Layout</th>
+                <th className="px-6 py-4 text-[11px] font-bold text-gray-400 uppercase tracking-widest">Correction Intelligence</th>
+                <th className="px-6 py-4 text-[11px] font-bold text-gray-400 uppercase tracking-widest text-right">Actions</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-gray-50">
+              {filtered.map((t) => {
+                const isEditing = editingId === t.id;
+                const edit = edits[t.id] || {};
+                const learnedRulesCount = t.learnedRules ? JSON.parse(t.learnedRules).length : 0;
+                const vocabCount = t.valueReplacements ? Object.keys(JSON.parse(t.valueReplacements)).reduce((acc, k) => acc + Object.keys(JSON.parse(t.valueReplacements)[k]).length, 0) : 0;
 
-            return (
-              <div key={t.id} className="bg-white border border-gray-200 rounded-xl overflow-hidden">
-                <button
-                  className="w-full flex items-center justify-between px-5 py-4 text-left hover:bg-gray-50"
-                  onClick={() => setExpanded(isExpanded ? null : t.id)}
-                >
-                  <div>
-                    <div className="font-medium">{t.architect.firmName}</div>
-                    {t.architect.firmAddress && <div className="text-xs text-gray-500 mt-0.5">{t.architect.firmAddress}</div>}
-                  </div>
-                  <span className="text-gray-400 text-sm">{isExpanded ? "▲" : "▼"}</span>
-                </button>
-
-                {isExpanded && (
-                  <div className="px-5 pb-5 border-t border-gray-100 pt-4 flex flex-col gap-4">
-                    <div className="grid grid-cols-2 gap-4">
-                      <div>
-                        <label className="text-xs font-medium text-gray-500 uppercase block mb-1">Title Block Location</label>
-                        <select
-                          value={(edit.titleBlockLocation ?? t.titleBlockLocation) || ""}
-                          onChange={(e) => setEdit(t.id, "titleBlockLocation", e.target.value)}
-                          className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none"
+                return (
+                  <React.Fragment key={t.id}>
+                    <tr className={`hover:bg-blue-50/30 transition-colors ${isEditing ? "bg-blue-50/50" : ""}`}>
+                      <td className="px-6 py-6">
+                        <div className="flex items-center gap-3">
+                          <div className="w-10 h-10 bg-blue-100 rounded-xl flex items-center justify-center shrink-0">
+                            <Building2 className="w-5 h-5 text-blue-600" />
+                          </div>
+                          <div>
+                            <div className="font-semibold text-gray-900 leading-tight">{t.architect.firmName}</div>
+                            {t.architect.firmAddress && <div className="text-xs text-gray-400 mt-1 truncate max-w-[180px]">{t.architect.firmAddress}</div>}
+                          </div>
+                        </div>
+                      </td>
+                      <td className="px-6 py-6">
+                        <div className="flex flex-wrap gap-2">
+                          <div className="flex items-center gap-1.5 px-2 py-1 bg-gray-100 border border-gray-200 rounded-md text-[10px] font-bold text-gray-600 uppercase">
+                            <Layout className="w-3 h-3" /> Block: {t.titleBlockLocation || "Auto"}
+                          </div>
+                          <div className="flex items-center gap-1.5 px-2 py-1 bg-gray-100 border border-gray-200 rounded-md text-[10px] font-bold text-gray-600 uppercase">
+                            <Clock className="w-3 h-3" /> Revs: {t.revisionBlockLocation || "Default"}
+                          </div>
+                        </div>
+                      </td>
+                      <td className="px-6 py-6">
+                        <div className="flex items-center gap-4">
+                          <div className="flex flex-col">
+                            <span className="text-xs font-semibold text-gray-900 flex items-center gap-1.5">
+                              <BrainCircuit className="w-3.5 h-3.5 text-fuchsia-500" /> 
+                              {learnedRulesCount} Learned Rule{learnedRulesCount !== 1 ? 's' : ''}
+                            </span>
+                            <span className="text-[10px] text-gray-400 mt-0.5">{vocabCount} terminology mappings stored</span>
+                          </div>
+                        </div>
+                      </td>
+                      <td className="px-6 py-6 text-right">
+                        <button 
+                          onClick={() => setEditingId(isEditing ? null : t.id)}
+                          className={`inline-flex items-center gap-2 px-4 py-2 text-sm font-semibold rounded-xl transition-all shadow-sm ${isEditing ? "bg-white text-gray-700 border border-gray-200" : "bg-blue-600 text-white hover:bg-blue-700"}`}
                         >
-                          <option value="">unknown</option>
-                          <option value="bottom">bottom</option>
-                          <option value="bottom-right">bottom-right</option>
-                          <option value="right">right</option>
-                          <option value="left">left</option>
-                        </select>
-                      </div>
-                      <div>
-                        <label className="text-xs font-medium text-gray-500 uppercase block mb-1">Revision Block Location</label>
-                        <select
-                          value={(edit.revisionBlockLocation ?? t.revisionBlockLocation) || ""}
-                          onChange={(e) => setEdit(t.id, "revisionBlockLocation", e.target.value)}
-                          className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none"
-                        >
-                          <option value="">unknown</option>
-                          <option value="top-left">top-left</option>
-                          <option value="left-of-title-block">left-of-title-block</option>
-                          <option value="integrated">integrated</option>
-                          <option value="none">none</option>
-                        </select>
-                      </div>
-                      <div>
-                        <label className="text-xs font-medium text-gray-500 uppercase block mb-1">Revision Reading Direction</label>
-                        <select
-                          value={(edit.revisionReadingDirection ?? t.revisionReadingDirection) || ""}
-                          onChange={(e) => setEdit(t.id, "revisionReadingDirection", e.target.value)}
-                          className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none"
-                        >
-                          <option value="">unknown</option>
-                          <option value="top-to-bottom">top-to-bottom</option>
-                          <option value="bottom-to-top">bottom-to-top</option>
-                        </select>
-                      </div>
-                    </div>
+                          {isEditing ? "Cancel" : "Configure Intelligence"}
+                          {!isEditing && <ChevronRight className="w-4 h-4" />}
+                        </button>
+                      </td>
+                    </tr>
+                    
+                    {/* Expandable Editing Section */}
+                    {isEditing && (
+                      <tr>
+                        <td colSpan={4} className="px-8 pb-10 bg-blue-50/30">
+                          <div className="bg-white border border-blue-200 rounded-2xl shadow-lg p-8 grid grid-cols-1 md:grid-cols-2 gap-8 animate-slide-down">
+                            
+                            {/* Layout Configuration */}
+                            <div className="space-y-6">
+                              <div className="flex items-center gap-2 mb-2">
+                                <Layout className="w-4 h-4 text-blue-600" />
+                                <h4 className="text-sm font-bold text-gray-900 uppercase tracking-wider">Extraction Layout</h4>
+                              </div>
+                              
+                              <div className="grid grid-cols-2 gap-4">
+                                <div className="space-y-1.5">
+                                  <label className="text-[10px] font-bold text-gray-400 uppercase tracking-wider">Title Block Location</label>
+                                  <select
+                                    value={(edit.titleBlockLocation ?? t.titleBlockLocation) || ""}
+                                    onChange={(e) => setEdit(t.id, "titleBlockLocation", e.target.value)}
+                                    className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 transition-all"
+                                  >
+                                    <option value="">unknown</option>
+                                    <option value="bottom">bottom</option>
+                                    <option value="bottom-right">bottom-right</option>
+                                    <option value="right">right</option>
+                                    <option value="left">left</option>
+                                  </select>
+                                </div>
+                                <div className="space-y-1.5">
+                                  <label className="text-[10px] font-bold text-gray-400 uppercase tracking-wider">Revision Block</label>
+                                  <select
+                                    value={(edit.revisionBlockLocation ?? t.revisionBlockLocation) || ""}
+                                    onChange={(e) => setEdit(t.id, "revisionBlockLocation", e.target.value)}
+                                    className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 transition-all"
+                                  >
+                                    <option value="">unknown</option>
+                                    <option value="top-left">top-left</option>
+                                    <option value="left-of-title-block">left-of-title-block</option>
+                                    <option value="integrated">integrated</option>
+                                    <option value="none">none</option>
+                                  </select>
+                                </div>
+                              </div>
 
-                    <div>
-                      <label className="text-xs font-medium text-gray-500 uppercase block mb-1">
-                        Revision Column Order (JSON array, e.g. ["rev","date","description","by"])
-                      </label>
-                      <JsonEditor
-                        value={edit.revisionColumnOrder ?? t.revisionColumnOrder}
-                        onChange={(v) => setEdit(t.id, "revisionColumnOrder", v)}
-                      />
-                    </div>
+                              <div className="space-y-1.5">
+                                <label className="text-[10px] font-bold text-gray-400 uppercase tracking-wider">Revision Direction</label>
+                                <select
+                                  value={(edit.revisionReadingDirection ?? t.revisionReadingDirection) || ""}
+                                  onChange={(e) => setEdit(t.id, "revisionReadingDirection", e.target.value)}
+                                  className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 transition-all"
+                                >
+                                  <option value="">unknown</option>
+                                  <option value="top-to-bottom">top-to-bottom</option>
+                                  <option value="bottom-to-top">bottom-to-top</option>
+                                </select>
+                              </div>
 
-                    <div>
-                      <label className="text-xs font-medium text-gray-500 uppercase block mb-1">
-                        Field Label Map (JSON, maps discovered labels → canonical names)
-                      </label>
-                      <JsonEditor
-                        value={edit.fieldLabelMap ?? t.fieldLabelMap}
-                        onChange={(v) => setEdit(t.id, "fieldLabelMap", v)}
-                      />
-                    </div>
+                              <JsonEditor
+                                label="Revision Column mapping"
+                                value={edit.revisionColumnOrder ?? t.revisionColumnOrder}
+                                onChange={(v) => setEdit(t.id, "revisionColumnOrder", v)}
+                              />
+                            </div>
 
-                    <div className="flex items-center justify-between">
-                      <span className="text-xs text-gray-400">Last updated {new Date(t.lastUpdated).toLocaleDateString()}</span>
-                      <button
-                        onClick={() => save(t.id)}
-                        disabled={saving === t.id || !edits[t.id]}
-                        className="text-sm bg-gray-900 text-white px-4 py-2 rounded-lg hover:bg-gray-700 disabled:opacity-50"
-                      >
-                        {saving === t.id ? "Saving…" : "Save"}
-                      </button>
-                    </div>
-                  </div>
-                )}
-              </div>
-            );
-          })}
+                            {/* Cognitive Intelligence Configuration */}
+                            <div className="space-y-6">
+                              <div className="flex items-center gap-2 mb-2">
+                                <BrainCircuit className="w-4 h-4 text-fuchsia-600" />
+                                <h4 className="text-sm font-bold text-gray-900 uppercase tracking-wider">Neural Corrections</h4>
+                              </div>
+
+                              <JsonEditor
+                                label="Field Label Overrides"
+                                value={edit.fieldLabelMap ?? t.fieldLabelMap}
+                                onChange={(v) => setEdit(t.id, "fieldLabelMap", v)}
+                              />
+
+                              <div className="bg-fuchsia-50/50 border border-fuchsia-100 rounded-xl p-4">
+                                <div className="flex items-start gap-3">
+                                  <Sparkles className="w-5 h-5 text-fuchsia-500 mt-0.5" />
+                                  <div>
+                                    <div className="text-xs font-bold text-fuchsia-900 uppercase tracking-wide mb-1">Implicit Pattern Engine</div>
+                                    <p className="text-xs text-fuchsia-800/80 leading-relaxed">
+                                      This architect has <span className="font-bold underline">{learnedRulesCount} active structural rules</span> and <span className="font-bold underline">{vocabCount} correction mappings</span>.
+                                      These are updated automatically when you correct a drawing in the viewer.
+                                    </p>
+                                    <div className="mt-3 flex gap-2">
+                                      <button className="text-[10px] font-bold text-fuchsia-700 bg-white border border-fuchsia-200 rounded px-2 py-1 hover:bg-fuchsia-100 transition-colors uppercase tracking-wider">
+                                        View Neural Summary
+                                      </button>
+                                    </div>
+                                  </div>
+                                </div>
+                              </div>
+
+                              {/* Footer Actions */}
+                              <div className="pt-4 flex items-center justify-between border-t border-gray-100">
+                                <div className="flex items-center gap-2 text-[10px] font-bold text-gray-400 uppercase tracking-wider">
+                                  <Clock className="w-3 h-3" /> Last Indexed: {new Date(t.lastUpdated).toLocaleDateString()}
+                                </div>
+                                <div className="flex gap-3">
+                                  <button
+                                    onClick={() => setEditingId(null)}
+                                    className="px-4 py-2 text-sm font-semibold text-gray-600 rounded-xl hover:bg-gray-50 transition-all border border-transparent"
+                                  >
+                                    Discard
+                                  </button>
+                                  <button
+                                    onClick={() => save(t.id)}
+                                    disabled={saving === t.id || !edits[t.id]}
+                                    className="flex items-center gap-2 px-6 py-2 bg-blue-600 text-white text-sm font-bold rounded-xl hover:bg-blue-700 disabled:opacity-50 transition-all shadow-md active:scale-95"
+                                  >
+                                    {saving === t.id ? (
+                                      <div className="w-4 h-4 border-2 border-white/20 border-t-white rounded-full animate-spin" />
+                                    ) : (
+                                      <Save className="w-4 h-4" />
+                                    )}
+                                    Synchronize Rules
+                                  </button>
+                                </div>
+                              </div>
+                            </div>
+
+                          </div>
+                        </td>
+                      </tr>
+                    )}
+                  </React.Fragment>
+                );
+              })}
+            </tbody>
+          </table>
         </div>
       )}
     </div>
   );
 }
+
+import React from "react";

@@ -15,6 +15,7 @@ export interface GeminiExtractionResult {
   revision_date: string | null;
   status: string | null;
   location: string | null;
+  architect_firm_name: string | null;
   confidence: {
     drawing_number: number;
     drawing_title: number;
@@ -54,13 +55,14 @@ You will receive a JSON array of text elements extracted from a construction dra
 - "page_width": total page width in pixels
 - "page_height": total page height in pixels
 
-Your job is to extract exactly six fields from this drawing:
+Your job is to extract exactly seven fields from this drawing:
 1. drawing_number
 2. drawing_title
 3. revision
 4. revision_date
 5. status
 6. location
+7. architect_firm_name
 
 ---
 
@@ -139,6 +141,12 @@ LOCATION
 - Do NOT extract: project name, project number, client name, or architect address
 - If no address is found, return null
 
+ARCHITECT FIRM NAME
+- Look for the authoring company name, usually prominent in the title block or near the logo
+- Often accompanied by "Architects", "Engineers", "Pty Ltd"
+- Return the clean name without address or phone numbers
+- If no explicit firm is found, return null
+
 CRITICAL: NEVER USE THESE AS FIELD VALUES
 - @A1, @A0, @A3, @A2 → these are scale notations
 - "REMIT VERSION" followed by a year → this is a file version, not a revision
@@ -164,7 +172,7 @@ Return confidence as 0.0–1.0 for each field:
 
 Set conflict_detected to true if title block revision ≠ revision block most recent revision.
 
-For field_coordinates: for each field, return the {x, y} pixel position of the text element where you found the value. Use the x/y from the input element array. If a field is null or not found, set its coordinate to null.
+For field_coordinates: for each core extraction field (drawing_number, drawing_title, revision, revision_date, status, location), return the {x, y} pixel position of the text element where you found the value. Use the x/y from the input element array. If a field is null or not found, set its coordinate to null.
 
 {
   "drawing_number": "string | null",

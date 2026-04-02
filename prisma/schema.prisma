@@ -25,6 +25,7 @@ model Architect {
   createdAt  DateTime   @default(now())
   drawings   Drawing[]
   template   Template?
+  corrections Correction[]
 }
 
 model Drawing {
@@ -113,9 +114,12 @@ model Correction {
   id             String   @id @default(cuid())
   drawingId      String
   drawing        Drawing  @relation(fields: [drawingId], references: [id], onDelete: Cascade)
+  architectId    String?
+  architect      Architect? @relation(fields: [architectId], references: [id])
   fieldName      String
   originalValue  String?
   correctedValue String?
+  pattern        String?  // JSON string: { type: 'prefix', value: 'AD' }
   correctedAt    DateTime @default(now())
 }
 
@@ -131,6 +135,16 @@ model Template {
   titleBlockPattern     String?   // JSON: {side, bbox:{x0,y0,x1,y1}, confirmedDrawingCount, architectFirmName, drawingNumberFormat}
   fieldPositions        String?   // JSON object mapping fields to {x,y} exact coordinates
   valueReplacements     String?   // JSON object storing correction history { fieldName: { originalValue: correctedValue } }
+  learnedRules          String?   // JSON array of structured rules [{ type: 'prefix', field: 'drawingNumber', ... }]
   sampleDrawingId       String?
   lastUpdated           DateTime  @default(now())
 }
+
+model SystemRule {
+  id          String   @id @default(cuid())
+  ruleType    String   @unique // e.g., "STATUS_NORMALISATION"
+  content     String   // JSON string storing the exact mapping for this category
+  description String?
+  lastUpdated DateTime @default(now())
+}
+

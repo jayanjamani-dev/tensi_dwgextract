@@ -320,3 +320,189 @@ export async function updateTemplateFromCorrection(
   }
   void fieldName;
 }
+
+// ── Core Auto-Learning: Architect Resolution + Template Update ──────
+
+const PATTERN_LOCK_THRESHOLD_LEARN = 2;
+
+export interface TemplateLearningInput {
+  drawingId: string;
+  drawingNumber: string | null;
+  titleBlockLocation: string | null;
+  revisionBlockLocation: string | null;
+  fieldCoordinates: Record<string, { x: number; y: number }> | null;
+  elements: TextElement[];
+  projectId: string;
+  projectName: string;
+  geminiArchitectFirmName?: string | null;
+  existingArchitectId: string | null;
+}
+
+export interface TemplateLearningResult {
+  architectId: string | null;
+  flags: string[];
+  log: string[];
+}
+
+/**
+ * The main template auto-learning trigger.
+ * 1. Resolves (or creates) the Architect entity from extraction output or project siblings.
+ * 2. Links the drawing to the Architect in the DB.
+ * 3. Creates or updates the architect's TitleBlockPattern template.
+ *
+ * Call this AFTER every successful Gemini extraction.
+ */
+export async function resolveArchitectAndLearnTemplate(
+  input: TemplateLearningInput
+): Promise<TemplateLearningResult> {
+  const flags: string[] = [];
+  const log: string[] = [];
+
+  // ── Step A: Resolve architect ─────────────────────────────────
+  let architectId = input.existingArchitectId;
+
+  if (!architectId) {
+    // Try to inherit from a sibling drawing in the same project
+    const sibling = await prisma.drawing.findFirst({
+      where: {
+        projectId: input.projectId,
+        architectId: { not: null },
+        id: { not: input.drawingId },
+      },
+      select: { architectId: true },
+    });
+
+    if (sibling?.architectId) {
+      architectId = sibling.architectId;
+      flags.push("ARCH_RESOLVED_FROM_SIBLING");
+      log.push(`ARCH_RESOLVED_FROM_SIBLING: ${architectId}`);
+    }
+  }
+
+  if (!architectId) {
+    // Use Gemini-extracted firm name to find or create architect
+    const firmName = input.geminiArchitectFirmName?.trim();
+    if (firmName && firmName.length > 2) {
+      const existing = await prisma.architect.findFirst({
+        where: { firmName: { equals: firmName } },
+      });
+      if (existing) {
+        architectId = existing.id;
+        log.push(`ARCH_FOUND_BY_NAME: ${firmName}`);
+      } else {
+        const created = await prisma.architect.create({
+          data: { firmName },
+        });
+        architectId = created.id;
+        flags.push("ARCH_AUTO_CREATED");
+        log.push(`ARCH_CREATED: ${firmName} (${architectId})`);
+      }
+    }
+  }
+
+  if (!architectId) {
+    // Final fallback: use a shared "Unknown" architect per project so templates still accumulate
+    const unknownName = `Unknown (Project ${input.projectId.slice(-6)})`;
+    const existing = await prisma.architect.findFirst({
+      where: { firmName: unknownName },
+    });
+    if (existing) {
+      architectId = existing.id;
+    } else {
+      const created = await prisma.architect.create({ data: { firmName: unknownName } });
+      architectId = created.id;
+    }
+    flags.push("ARCH_FALLBACK_UNKNOWN");
+    log.push(`ARCH_FALLBACK: using "${unknownName}"`);
+  }
+
+  // ── Step B: Link drawing to architect ────────────────────────
+  await prisma.drawing.update({
+    where: { id: input.drawingId },
+    data: { architectId },
+  });
+  log.push(`DRAWING_LINKED: architectId=${architectId}`);
+
+  // ── Step C: Learn template pattern ───────────────────────────
+  if (!input.drawingNumber) {
+    log.push("TEMPLATE_SKIP: no drawing number extracted");
+    return { architectId, flags, log };
+  }
+
+  const side: "bottom" | "right" =
+    input.titleBlockLocation === "right" ? "right" : "bottom";
+
+  const currentPattern = await getTemplatePattern(architectId);
+  const drawingNumberFormat = inferDrawingNumberFormat(input.drawingNumber);
+  const cleanFieldPositions =
+    input.fieldCoordinates && Object.keys(input.fieldCoordinates).length > 0
+      ? input.fieldCoordinates
+      : null;
+
+  const elements = input.elements;
+  const pageWidth = elements[0]?.page_width ?? 595;
+  const pageHeight = elements[0]?.page_height ?? 842;
+
+  const regionBbox: TitleBlockBbox =
+    side === "bottom"
+      ? { x0: 0, y0: pageHeight * 0.75, x1: pageWidth, y1: pageHeight }
+      : { x0: pageWidth * 0.7, y0: 0, x1: pageWidth, y1: pageHeight };
+
+  const architect = await prisma.architect.findUnique({
+    where: { id: architectId },
+    select: { firmName: true },
+  });
+
+  if (!currentPattern) {
+    const newPattern: TitleBlockPattern = {
+      side,
+      bbox: regionBbox,
+      confirmedDrawingCount: 1,
+      architectFirmName: architect?.firmName ?? "Unknown",
+      drawingNumberFormat: drawingNumberFormat ?? undefined,
+    };
+    await saveTemplatePattern(
+      architectId,
+      newPattern,
+      input.titleBlockLocation ?? undefined,
+      input.revisionBlockLocation ?? undefined,
+      cleanFieldPositions
+    );
+    log.push(`TEMPLATE_CREATED (count=1, side=${side})`);
+  } else if (currentPattern.confirmedDrawingCount < PATTERN_LOCK_THRESHOLD_LEARN) {
+    if (currentPattern.side === side) {
+      currentPattern.confirmedDrawingCount += 1;
+      if (!currentPattern.drawingNumberFormat && drawingNumberFormat) {
+        currentPattern.drawingNumberFormat = drawingNumberFormat;
+      }
+      await saveTemplatePattern(
+        architectId,
+        currentPattern,
+        input.titleBlockLocation ?? undefined,
+        input.revisionBlockLocation ?? undefined,
+        cleanFieldPositions
+      );
+      log.push(`TEMPLATE_UPDATED (count=${currentPattern.confirmedDrawingCount}, side=${side})`);
+      if (currentPattern.confirmedDrawingCount >= PATTERN_LOCK_THRESHOLD_LEARN) {
+        flags.push("PATTERN_LOCKED");
+        log.push("PATTERN_LOCKED");
+      }
+    } else {
+      flags.push("PATTERN_SIDE_MISMATCH");
+      log.push(`TEMPLATE_SIDE_MISMATCH: expected ${currentPattern.side}, got ${side}`);
+    }
+  } else {
+    // Pattern already locked
+    if (currentPattern.side === side) {
+      await incrementPatternConfirmation(architectId);
+      flags.push("PATTERN_CONFIRMED");
+      log.push(`PATTERN_CONFIRMED (count=${currentPattern.confirmedDrawingCount + 1})`);
+    } else {
+      flags.push("PATTERN_MISMATCH");
+      log.push(`PATTERN_MISMATCH_LOCKED: expected ${currentPattern.side}, got ${side}`);
+    }
+  }
+
+  return { architectId, flags, log };
+}
+

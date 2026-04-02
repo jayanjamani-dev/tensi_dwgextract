@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/db";
+import { detectPattern, applyPattern, matchesPattern } from "@/lib/pattern-detector";
 
 export async function GET(
   _req: NextRequest,
@@ -56,44 +57,74 @@ export async function PATCH(
 
   const drawing = await prisma.drawing.update({ where: { id }, data: updates });
 
-  const similarErrors: Record<string, { original: string; corrected: string; affectedIds: string[]; count: number }> = {};
+  const similarErrors: Record<string, { original: string; corrected: string; affectedIds: string[]; count: number; isGlobal?: boolean }> = {};
 
   if (corrections.length > 0) {
-    await prisma.correction.createMany({ data: corrections });
+    // Attach architectId to corrections
+    const correctionsWithArchitect = corrections.map(c => ({
+      ...c,
+      architectId: current.architectId
+    }));
+    await prisma.correction.createMany({ data: correctionsWithArchitect });
 
-    for (const correction of corrections) {
-      if (correction.originalValue && current.architectId && correction.correctedValue) {
-        // 1. Log to Architect Template
-        const template = await prisma.template.findUnique({ where: { architectId: current.architectId } });
+    for (const correction of correctionsWithArchitect) {
+      if (correction.originalValue && correction.architectId && correction.correctedValue) {
+        // 1. Detect Pattern
+        const pattern = detectPattern(correction.originalValue, correction.correctedValue);
+        
+        // 2. Log to Architect Template & Learned Rules
+        const template = await prisma.template.findUnique({ where: { architectId: correction.architectId } });
         if (template) {
           const replacements = template.valueReplacements ? JSON.parse(template.valueReplacements) : {};
           if (!replacements[correction.fieldName]) replacements[correction.fieldName] = {};
-          
-          // Only add replacement if it's not a deletion mapping (or we can allow deletion mappings too, but value shouldn't be null)
           replacements[correction.fieldName][correction.originalValue] = correction.correctedValue;
           
+          let learnedRules = template.learnedRules ? JSON.parse(template.learnedRules) : [];
+          if (pattern && pattern.type !== "exact") {
+              // Add or update pattern rule
+              const existingIdx = learnedRules.findIndex((r: any) => r.type === pattern.type && r.field === correction.fieldName && r.value === pattern.value);
+              if (existingIdx === -1) {
+                  learnedRules.push({ ...pattern, field: correction.fieldName, exampleOriginal: correction.originalValue, exampleCorrected: correction.correctedValue, lastSeen: new Date() });
+              } else {
+                  learnedRules[existingIdx].lastSeen = new Date();
+              }
+          }
+
           await prisma.template.update({
             where: { id: template.id },
-            data: { valueReplacements: JSON.stringify(replacements), lastUpdated: new Date() },
+            data: { 
+                valueReplacements: JSON.stringify(replacements), 
+                learnedRules: JSON.stringify(learnedRules),
+                lastUpdated: new Date() 
+            },
           });
         }
 
-        // 2. Find similar errors in the same project
-        const similarDrawings = await prisma.drawing.findMany({
+        // 3. Find similar errors GLOBALLY (same architect)
+        const allDrawingsForArchitect = await prisma.drawing.findMany({
           where: {
-            projectId: current.projectId,
-            [correction.fieldName]: correction.originalValue,
-            id: { not: current.id }, 
+            architectId: correction.architectId,
+            id: { not: current.id },
           },
-          select: { id: true }
+          select: { id: true, [correction.fieldName]: true, filename: true, projectId: true }
         });
 
-        if (similarDrawings.length > 0) {
+        const matches = allDrawingsForArchitect.filter(d => {
+            const val = (d as any)[correction.fieldName];
+            if (pattern && pattern.type !== "exact") {
+                return matchesPattern(val, correction.originalValue, pattern);
+            }
+            return val === correction.originalValue;
+        });
+
+        if (matches.length > 0) {
+          const projectIds = new Set(matches.map(m => (m as any).projectId));
           similarErrors[correction.fieldName] = {
-            original: correction.originalValue,
-            corrected: correction.correctedValue,
-            affectedIds: similarDrawings.map((d: { id: string }) => d.id),
-            count: similarDrawings.length,
+            original: correction.originalValue!,
+            corrected: correction.correctedValue!,
+            affectedIds: matches.map(d => String((d as any).id)),
+            count: matches.length,
+            isGlobal: projectIds.size > 1 || !projectIds.has(current.projectId),
           };
         }
       }
