@@ -20,6 +20,13 @@ interface ExtractedField {
   color: string;
 }
 
+export interface BoundingBox {
+  x0: number;
+  y0: number;
+  x1: number;
+  y1: number;
+}
+
 interface Props {
   url: string;
   pageNumber?: number;
@@ -27,15 +34,102 @@ interface Props {
   titleBlockCoords?: TitleBlockCoords | null;
   titleBlockLocation?: string | null;
   extractedFields?: ExtractedField[];
+  onRegionExtract?: (bbox: BoundingBox, fieldName: string, imageBase64?: string | null) => void;
 }
 
-export default function PDFViewer({ url, pageNumber = 1, titleBlockCoords, titleBlockLocation, extractedFields = [] }: Props) {
+export default function PDFViewer({ url, pageNumber = 1, titleBlockCoords, titleBlockLocation, extractedFields = [], onRegionExtract }: Props) {
   const [numPages, setNumPages] = useState<number>(0);
   const [pageNum, setPageNum] = useState(pageNumber);
   const [scale, setScale] = useState(1.0);
   const [error, setError] = useState<string | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const [pageLoaded, setPageLoaded] = useState(false);
+
+  // Region selection states
+  const [isSelectMode, setIsSelectMode] = useState(false);
+  const [dragStart, setDragStart] = useState<{ x: number; y: number } | null>(null);
+  const [currentPos, setCurrentPos] = useState<{ x: number; y: number } | null>(null);
+  const [finalBbox, setFinalBbox] = useState<{ x: number; y: number; w: number; h: number } | null>(null);
+  const [selectedField, setSelectedField] = useState("drawingNumber");
+  
+  // Handlers for region selection
+  const handlePointerDown = (e: React.PointerEvent) => {
+    if (!isSelectMode || e.button !== 0) return; // Only left click in select mode
+    e.preventDefault();
+    const rect = e.currentTarget.getBoundingClientRect();
+    setDragStart({ x: e.clientX - rect.left, y: e.clientY - rect.top });
+    setCurrentPos({ x: e.clientX - rect.left, y: e.clientY - rect.top });
+    setFinalBbox(null);
+  };
+
+  const handlePointerMove = (e: React.PointerEvent) => {
+    if (!dragStart) return;
+    const rect = e.currentTarget.getBoundingClientRect();
+    setCurrentPos({ x: e.clientX - rect.left, y: e.clientY - rect.top });
+  };
+
+  const handlePointerUp = () => {
+    if (!dragStart || !currentPos) return;
+    const px0 = Math.min(dragStart.x, currentPos.x);
+    const py0 = Math.min(dragStart.y, currentPos.y);
+    const px1 = Math.max(dragStart.x, currentPos.x);
+    const py1 = Math.max(dragStart.y, currentPos.y);
+    const w = px1 - px0;
+    const h = py1 - py0;
+
+    if (w > 10 && h > 10) {
+      setFinalBbox({ x: px0, y: py0, w, h });
+    } else {
+      setFinalBbox(null);
+    }
+    setDragStart(null);
+    setCurrentPos(null);
+  };
+
+  const handleExtractClick = () => {
+    if (!finalBbox || !onRegionExtract) return;
+    
+    // Convert DOM space coordinates to PDF space (divide by scale)
+    const bbox: BoundingBox = {
+      x0: finalBbox.x / scale,
+      y0: finalBbox.y / scale,
+      x1: (finalBbox.x + finalBbox.w) / scale,
+      y1: (finalBbox.y + finalBbox.h) / scale,
+    };
+
+    let imageBase64: string | null = null;
+    const canvas = containerRef.current?.querySelector(".react-pdf__Page canvas") as HTMLCanvasElement;
+    if (canvas) {
+      try {
+        const cropCanvas = document.createElement("canvas");
+        const rect = canvas.getBoundingClientRect();
+        const scaleX = canvas.width / rect.width;
+        const scaleY = canvas.height / rect.height;
+        
+        cropCanvas.width = finalBbox.w * scaleX;
+        cropCanvas.height = finalBbox.h * scaleY;
+        const ctx = cropCanvas.getContext("2d");
+        if (ctx) {
+          ctx.drawImage(
+            canvas,
+            finalBbox.x * scaleX,
+            finalBbox.y * scaleY,
+            finalBbox.w * scaleX,
+            finalBbox.h * scaleY,
+            0,
+            0,
+            cropCanvas.width,
+            cropCanvas.height
+          );
+          imageBase64 = cropCanvas.toDataURL("image/jpeg", 0.9);
+        }
+      } catch (e) {
+        console.error("Failed to extract canvas crop", e);
+      }
+    }
+
+    onRegionExtract(bbox, selectedField, imageBase64);
+  };
 
   // Auto-scroll to title block when page loads
   const scrollToTitleBlock = useCallback(() => {
@@ -110,10 +204,26 @@ export default function PDFViewer({ url, pageNumber = 1, titleBlockCoords, title
             className="px-2 py-0.5 rounded bg-gray-700 hover:bg-gray-600 disabled:opacity-40"
           >›</button>
         </div>
-        <div className="flex items-center gap-1 ml-auto">
-          <button onClick={() => setScale((s) => Math.max(0.4, s - 0.2))} className="px-2 py-0.5 rounded bg-gray-700 hover:bg-gray-600">−</button>
-          <span className="text-xs text-gray-300 w-10 text-center">{(scale * 100).toFixed(0)}%</span>
-          <button onClick={() => setScale((s) => Math.min(3, s + 0.2))} className="px-2 py-0.5 rounded bg-gray-700 hover:bg-gray-600">+</button>
+        <div className="flex items-center gap-4 ml-auto">
+          {onRegionExtract && (
+            <button
+              onClick={() => {
+                setIsSelectMode((s) => !s);
+                if (isSelectMode) setFinalBbox(null);
+              }}
+              className={`px-3 py-1 rounded text-xs font-medium transition-colors ${
+                isSelectMode ? "bg-amber-500 text-black hover:bg-amber-400" : "bg-gray-700 hover:bg-gray-600 text-gray-200"
+              }`}
+            >
+              {isSelectMode ? "Cancel Selection" : "Select Region"}
+            </button>
+          )}
+
+          <div className="flex items-center gap-1 border-l border-gray-700 pl-4">
+            <button onClick={() => setScale((s) => Math.max(0.4, s - 0.2))} className="px-2 py-0.5 rounded bg-gray-700 hover:bg-gray-600">−</button>
+            <span className="text-xs text-gray-300 w-10 text-center">{(scale * 100).toFixed(0)}%</span>
+            <button onClick={() => setScale((s) => Math.min(3, s + 0.2))} className="px-2 py-0.5 rounded bg-gray-700 hover:bg-gray-600">+</button>
+          </div>
         </div>
       </div>
 
@@ -174,6 +284,75 @@ export default function PDFViewer({ url, pageNumber = 1, titleBlockCoords, title
                   </div>
                 );
               })}
+
+              {/* Selection Drag Overlay */}
+              {isSelectMode && (
+                <div 
+                  className="absolute inset-0 z-50 cursor-crosshair"
+                  onPointerDown={handlePointerDown}
+                  onPointerMove={handlePointerMove}
+                  onPointerUp={handlePointerUp}
+                  onPointerCancel={handlePointerUp}
+                  style={{ touchAction: 'none' }}
+                >
+                  {/* Drawing rect */}
+                  {dragStart && currentPos && (
+                    <div 
+                      className="absolute border border-amber-500 bg-amber-500/20"
+                      style={{
+                        left: Math.min(dragStart.x, currentPos.x),
+                        top: Math.min(dragStart.y, currentPos.y),
+                        width: Math.abs(currentPos.x - dragStart.x),
+                        height: Math.abs(currentPos.y - dragStart.y),
+                      }}
+                    />
+                  )}
+                  {/* Final rect */}
+                  {finalBbox && (
+                    <div 
+                      className="absolute border-2 border-amber-500 bg-amber-500/20 shadow-lg pointer-events-none"
+                      style={{
+                        left: finalBbox.x,
+                        top: finalBbox.y,
+                        width: finalBbox.w,
+                        height: finalBbox.h,
+                      }}
+                    />
+                  )}
+                </div>
+              )}
+
+              {/* Selection Context Menu - renders outside the drag overlay to be clickable */}
+              {isSelectMode && finalBbox && (
+                <div 
+                  className="absolute z-50 bg-gray-900 border border-gray-700 shadow-2xl rounded p-2 flex flex-col gap-2 drop-shadow-xl"
+                  style={{
+                    left: finalBbox.x,
+                    top: finalBbox.y + finalBbox.h + 8, // below the box
+                  }}
+                >
+                  <select 
+                    title="select a field"
+                    className="bg-gray-800 text-sm text-white px-2 py-1 rounded outline-none border border-gray-600 focus:border-amber-500 w-full"
+                    value={selectedField}
+                    onChange={(e) => setSelectedField(e.target.value)}
+                  >
+                    <option value="drawingNumber">Drawing Number</option>
+                    <option value="drawingTitle">Drawing Title</option>
+                    <option value="revision">Revision</option>
+                    <option value="revisionDate">Revision Date</option>
+                    <option value="status">Status</option>
+                    <option value="location">Location</option>
+                  </select>
+                  <button 
+                    onClick={handleExtractClick}
+                    className="bg-amber-500 hover:bg-amber-400 text-black text-sm font-semibold rounded px-4 py-1.5 transition-colors shadow"
+                  >
+                    Extract and Learn
+                  </button>
+                </div>
+              )}
+
             </Page>
           </Document>
         )}

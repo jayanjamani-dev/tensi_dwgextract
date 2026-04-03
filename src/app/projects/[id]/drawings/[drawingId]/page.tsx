@@ -21,6 +21,13 @@ interface FieldCoordinates {
   location:       FieldCoordinate | null;
 }
 
+interface BoundingBox {
+  x0: number;
+  y0: number;
+  x1: number;
+  y1: number;
+}
+
 interface Drawing {
   id: string;
   filename: string;
@@ -88,6 +95,17 @@ export default function DrawingDetailPage() {
   const [drawing, setDrawing] = useState<Drawing | null>(null);
   const [saving, setSaving]   = useState<string | null>(null);
   const [edits,  setEdits]    = useState<Partial<Record<string, string>>>({});
+  
+  // Cross check / Bulk apply state
+  const [crossCheckResult, setCrossCheckResult] = useState<{
+    bbox: BoundingBox;
+    fieldName: string;
+    matchedDrawingsCount: number;
+    matchedDrawingIds: string[];
+    extractedValue: string;
+    architectId?: string;
+  } | null>(null);
+  const [isApplyingBulk, setIsApplyingBulk] = useState(false);
 
   async function load() {
     const res  = await fetch(`/api/drawings/${drawingId}`);
@@ -108,6 +126,70 @@ export default function DrawingDetailPage() {
     setSaving(null);
     load();
     setEdits((prev) => { const n = { ...prev }; delete n[field]; return n; });
+  }
+
+  async function handleRegionExtract(bbox: BoundingBox, fieldName: string, imageBase64?: string | null) {
+    try {
+      const res = await fetch(`/api/drawings/${drawingId}/cross-check-region`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ fieldName, bbox, imageBase64 }),
+      });
+      const data = await res.json();
+      
+      if (data.extractedValue) {
+        setEdits((prev) => ({ ...prev, [fieldName]: data.extractedValue }));
+        setCrossCheckResult({ ...data, bbox, fieldName });
+      } else {
+        const manualVal = prompt(
+          "No embedded text could be cleanly extracted from this specific region (likely due to it being a scanned or vectorized PDF).\n\n" +
+          "Please type the value you see manually.\n" +
+          "We will save this coordinate rule for future drawings produced by this Architect."
+        );
+        if (manualVal) {
+          setEdits((prev) => ({ ...prev, [fieldName]: manualVal }));
+          setCrossCheckResult({
+            bbox,
+            fieldName,
+            matchedDrawingsCount: 0,
+            matchedDrawingIds: [],
+            extractedValue: manualVal,
+            architectId: data.architectId
+          });
+        }
+      }
+    } catch (err) {
+      alert("Error cross-checking region.");
+    }
+  }
+
+  async function handleBulkApply(applyToAll: boolean) {
+    if (!crossCheckResult || !drawing) return;
+    
+    // Always save the current drawing at minimum
+    const idsToApply = applyToAll && crossCheckResult.matchedDrawingIds.length > 0 
+      ? [...new Set([...crossCheckResult.matchedDrawingIds, drawing.id])]
+      : [drawing.id];
+      
+    setIsApplyingBulk(true);
+    try {
+      await fetch('/api/drawings/bulk-apply-region', {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          bbox: crossCheckResult.bbox,
+          fieldName: crossCheckResult.fieldName,
+          applyToDrawingIds: idsToApply,
+          architectId: crossCheckResult.architectId,
+        }),
+      });
+      setCrossCheckResult(null);
+      load(); // Reload to show official changes
+    } catch {
+      alert("Failed to apply changes.");
+    } finally {
+      setIsApplyingBulk(false);
+    }
   }
 
   const flags: string[] = drawing?.flags ? (JSON.parse(drawing.flags) as string[]) : [];
@@ -137,10 +219,10 @@ export default function DrawingDetailPage() {
       </div>
 
       {/* Split view */}
-      <div className="flex flex-1 overflow-hidden">
+      <div className="flex flex-1 overflow-hidden relative">
         {/* Left: PDF viewer */}
         <div className="flex-1 overflow-auto bg-gray-800 border-r border-gray-300">
-          <PDFViewer url={pdfUrl} />
+          <PDFViewer url={pdfUrl} onRegionExtract={handleRegionExtract} />
         </div>
 
         {/* Right: Data panel */}
@@ -267,6 +349,65 @@ export default function DrawingDetailPage() {
             </div>
           )}
         </div>
+        
+        {/* Bulk Apply Modal Overlay */}
+        {crossCheckResult && (
+          <div className="absolute inset-0 bg-gray-900/40 z-50 flex items-center justify-center p-4">
+            <div className="bg-white rounded-xl shadow-2xl overflow-hidden max-w-md w-full">
+              <div className="p-5 border-b border-gray-100 bg-amber-50">
+                <h3 className="text-lg font-semibold text-amber-900 flex items-center gap-2">
+                  <span>Region Extracted</span>
+                  <span className="bg-amber-200 text-amber-800 text-xs px-2 py-0.5 rounded-full capitalize">{crossCheckResult.fieldName.replace(/([A-Z])/g, ' $1').trim()}</span>
+                </h3>
+              </div>
+              <div className="p-6">
+                <div className="mb-4 text-center">
+                  <div className="text-sm text-gray-500 mb-1">Extracted Value</div>
+                  <div className="text-xl font-bold font-mono bg-gray-100 py-3 px-4 rounded text-gray-900 break-all">{crossCheckResult.extractedValue}</div>
+                </div>
+                
+                {crossCheckResult.matchedDrawingsCount > 0 ? (
+                  <p className="text-sm text-gray-600 mb-6 leading-relaxed">
+                    This location rule can be applied to <strong className="text-gray-900">{crossCheckResult.matchedDrawingsCount} other drawings</strong> in this project.
+                    Standard drawings will extract instantly. Scanned documents will be queued for automated visual AI extraction.
+                  </p>
+                ) : (
+                  <p className="text-sm text-gray-600 mb-6">
+                    No other drawings in this project are ready to extract this rule right now. 
+                    We will save this coordinate rule so any future drawings automatically scan this location!
+                  </p>
+                )}
+
+                <div className="flex flex-col gap-2">
+                  {crossCheckResult.matchedDrawingsCount > 0 && (
+                    <button
+                      onClick={() => handleBulkApply(true)}
+                      disabled={isApplyingBulk}
+                      className="w-full bg-amber-500 hover:bg-amber-400 disabled:opacity-50 disabled:bg-amber-500 text-black font-semibold py-2.5 rounded shadow transition-colors flex items-center justify-center gap-2"
+                    >
+                      {isApplyingBulk ? "Applying..." : `Yes, apply to all (${crossCheckResult.matchedDrawingsCount + 1} drawings)`}
+                    </button>
+                  )}
+                  <button
+                    onClick={() => handleBulkApply(false)}
+                    disabled={isApplyingBulk}
+                    className="w-full bg-white hover:bg-gray-50 disabled:opacity-50 disabled:bg-white text-gray-700 font-medium py-2 px-4 border border-gray-300 rounded transition-colors"
+                  >
+                    No, apply to this drawing only
+                  </button>
+                  <button
+                    onClick={() => setCrossCheckResult(null)}
+                    disabled={isApplyingBulk}
+                    className="w-full text-gray-500 hover:text-gray-700 font-medium py-2 px-4 transition-colors text-sm mt-1"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
       </div>
     </div>
   );

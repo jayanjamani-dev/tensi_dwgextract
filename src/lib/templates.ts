@@ -98,6 +98,29 @@ export async function getTemplatePattern(architectId: string | null): Promise<Ti
   return parsePattern(template?.titleBlockPattern);
 }
 
+/** Retrieves fully learned bounding box regions mapped by field name. */
+export async function getLearnedBboxRegions(architectId: string | null): Promise<Record<string, TitleBlockBbox> | null> {
+  if (!architectId) return null;
+  const template = await prisma.template.findUnique({
+    where: { architectId },
+    select: { fieldPositions: true },
+  });
+  if (!template || !template.fieldPositions) return null;
+  
+  try {
+    const raw = JSON.parse(template.fieldPositions);
+    const bboxes: Record<string, TitleBlockBbox> = {};
+    for (const [field, val] of Object.entries(raw)) {
+      if (val && typeof val === 'object' && 'x0' in val) {
+        bboxes[field] = val as TitleBlockBbox;
+      }
+    }
+    return Object.keys(bboxes).length > 0 ? bboxes : null;
+  } catch {
+    return null;
+  }
+}
+
 /** Upsert the title block pattern for an architect. */
 export async function saveTemplatePattern(
   architectId: string,

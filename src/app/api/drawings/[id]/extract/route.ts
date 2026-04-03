@@ -3,6 +3,7 @@ import { prisma } from "@/lib/db";
 import { extractTextFromPdf, extractTextFromRegions, extractTextFromCrop, TextElement } from "@/lib/pdfplumber";
 import { detectCoverSheet } from "@/lib/cover-sheet";
 import { extractWithGemini } from "@/lib/gemini";
+import { extractTextFromBbox, BoundingBox } from "@/lib/bbox-extraction";
 import { validateExtraction } from "@/lib/validate-extraction";
 import {
   getTemplateContext,
@@ -16,6 +17,7 @@ import {
   TitleBlockPattern,
   TitleBlockBbox,
   resolveArchitectAndLearnTemplate,
+  getLearnedBboxRegions,
 } from "@/lib/templates";
 import type { GeminiCallMetrics } from "@/lib/api-metrics";
 
@@ -232,6 +234,33 @@ export async function POST(
 
     // Merge pipeline flags into validated flags
     const allFlags = [...new Set([...pipelineFlags, ...validated.flags])];
+
+    // ── Step 4.5: Apply Manual BBox Overrides ─────────────────────
+    // For any field that was explicitly taught via bounding box selection, override the result.
+    const learnedBboxes = await getLearnedBboxRegions(drawing.architectId);
+    if (learnedBboxes) {
+      for (const [field, bbox] of Object.entries(learnedBboxes)) {
+        const val = extractTextFromBbox(elements, bbox as BoundingBox);
+        if (val) {
+          const map: Record<string, keyof typeof validated> = {
+            drawingNumber: "drawingNumber",
+            drawingTitle: "drawingTitle",
+            revision: "revision",
+            revisionDate: "revisionDate",
+            status: "status",
+            location: "location",
+          };
+          const key = map[field];
+          if (key) {
+            // override the value
+            (validated as any)[key] = val;
+            // mark 1.0 confidence since it was manually defined
+            (validated as any)[`confidence${key.charAt(0).toUpperCase() + key.slice(1)}`] = 1.0;
+            allFlags.push(`BBOX_OVERRIDE_${key.toUpperCase()}`);
+          }
+        }
+      }
+    }
 
     // Persist ApiCall record
     if (geminiMetrics) {
