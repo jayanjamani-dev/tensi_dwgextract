@@ -1,10 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/db";
-import { extractTextFromPdf, extractTextFromRegions, extractTextFromCrop, TextElement } from "@/lib/pdfplumber";
+import { extractTextFromRegions, extractTextFromCrop, renderPageAsImage, TextElement } from "@/lib/pdfplumber";
 import { detectCoverSheet } from "@/lib/cover-sheet";
-import { extractWithGemini } from "@/lib/gemini";
+import { extractWithGemini, extractWithGeminiVision } from "@/lib/gemini";
 import { extractTextFromBbox, BoundingBox } from "@/lib/bbox-extraction";
-import { validateExtraction } from "@/lib/validate-extraction";
+import { validateExtraction, crossValidateWithElements } from "@/lib/validate-extraction";
 import {
   getTemplateContext,
   getTemplatePattern,
@@ -14,6 +14,7 @@ import {
   inferDrawingNumberFormat,
   getProjectExtractedCount,
   getProjectConfirmedSide,
+  preResolveArchitectFromSibling,
   TitleBlockPattern,
   TitleBlockBbox,
   resolveArchitectAndLearnTemplate,
@@ -47,6 +48,21 @@ export async function POST(
   const pipelineFlags: string[] = [];
 
   try {
+    // ── Step 0: Template-first — pre-resolve architect before extraction ──
+    // If this drawing has no architectId yet, try to inherit from a sibling drawing
+    // in the same project. This makes template-first extraction work from the 2nd
+    // drawing onwards without waiting for Gemini to identify the architect.
+    let activeArchitectId = drawing.architectId;
+    if (!activeArchitectId) {
+      const siblingArchitectId = await preResolveArchitectFromSibling(id, drawing.project.id);
+      if (siblingArchitectId) {
+        activeArchitectId = siblingArchitectId;
+        pipelineFlags.push("ARCH_PRE_RESOLVED_FROM_SIBLING");
+        // Pre-link drawing to architect so template context is available immediately
+        await prisma.drawing.update({ where: { id }, data: { architectId: siblingArchitectId } });
+      }
+    }
+
     // ── Step 1: Smart PDF extraction ───────────────────────────────
     const pdfStart = Date.now();
     let elements: TextElement[] = [];
@@ -56,27 +72,43 @@ export async function POST(
     let detectedSide: "bottom" | "right" | "unknown" = "unknown";
     let usedBbox: TitleBlockBbox | null = null;
 
-    // Check for existing architect template pattern
-    const existingPattern = await getTemplatePattern(drawing.architectId);
+    // Check for existing architect template pattern (uses pre-resolved architectId)
+    const existingPattern = await getTemplatePattern(activeArchitectId);
+    if (existingPattern && existingPattern.confirmedDrawingCount >= PATTERN_LOCK_THRESHOLD) {
+      pipelineFlags.push("TEMPLATE_FAST_PATH");
+    }
 
     if (existingPattern && existingPattern.confirmedDrawingCount >= PATTERN_LOCK_THRESHOLD) {
-      // ── CROP MODE: Use known title block bbox ──
+      // ── TEMPLATE-HINTED CROP MODE ──
+      // Template bbox is a GUIDE, not a strict boundary. Expand it generously in
+      // the direction opposite to the title block side so any revision block rows
+      // that sit above/left of the template bbox are still captured. This prevents
+      // the crop from cutting off the most recent revision rows when the template
+      // was learned from a drawing with a shorter revision history.
+      const tpl = existingPattern.bbox;
+      const sideHint = existingPattern.side;
+      const expandedBbox =
+        sideHint === "bottom"
+          ? { x0: tpl.x0, y0: Math.max(0, tpl.y0 - 300), x1: tpl.x1, y1: tpl.y1 }
+          : sideHint === "right"
+            ? { x0: Math.max(0, tpl.x0 - 300), y0: tpl.y0, x1: tpl.x1, y1: tpl.y1 }
+            : tpl;
       const cropResult = await extractTextFromCrop(
         drawing.filepath,
         drawing.pageNumber,
-        existingPattern.bbox
+        expandedBbox
       );
 
       if (cropResult.error) {
         pdfError = cropResult.error;
       } else if (cropResult.elements.length === 0) {
-        // Crop returned nothing — fall back to regions
-        pipelineFlags.push("CROP_EMPTY_FALLBACK");
-        const regionResult = await extractTextFromRegions(drawing.filepath, drawing.pageNumber);
-        elements = regionResult.elements;
-        scanned = regionResult.scanned;
-        pdfError = regionResult.error;
-        detectedSide = regionResult.titleBlockSide;
+        // Crop returned no text elements — PDF has no text layer in the known title block area.
+        // Do NOT fall back to region extraction: on large A0/A1 PDFs, region extraction also
+        // returns 0 elements AND can time out (>30s), leaving the drawing in a failed state.
+        // Instead, set scanned=true to trigger the Vision fallback (renderPageAsImage → Gemini Vision).
+        // Vision sees the full page and can locate the title block visually.
+        pipelineFlags.push("CROP_EMPTY_SCANNED");
+        scanned = true;
       } else {
         // Validate pattern still matches this drawing
         const match = validatePatternMatch(
@@ -90,8 +122,9 @@ export async function POST(
           elements = cropResult.elements;
           scanned = cropResult.scanned;
           cropMode = true;
-          usedBbox = existingPattern.bbox;
+          usedBbox = { ...existingPattern, bbox: expandedBbox }.bbox;
           pipelineFlags.push("CROP_MODE");
+          pipelineFlags.push("CROP_EXPANDED");
         } else {
           // Pattern mismatch — fall back to regions
           pipelineFlags.push("PATTERN_MISMATCH");
@@ -122,13 +155,10 @@ export async function POST(
         scanned = regionResult.scanned;
         detectedSide = regionResult.titleBlockSide;
 
-        // If we have enough elements, use the regional scan; otherwise fallback to full page
+        // If the region is sparse, flag it but proceed — full-page extraction is
+        // prohibited because only title block text must be sent to the AI model.
         if (elements.length < 5 && !scanned) {
-          pipelineFlags.push("REGION_SPARSE_FALLBACK");
-          const fullResult = await extractTextFromPdf(drawing.filepath, drawing.pageNumber);
-          elements = fullResult.elements;
-          scanned = fullResult.scanned;
-          pdfError = fullResult.error;
+          pipelineFlags.push("REGION_SPARSE");
         }
       }
     }
@@ -150,30 +180,54 @@ export async function POST(
     }
 
     // ── Step 2: Cover sheet detection ─────────────────────────────
-    // For cover sheet detection, need full-page text — use extracted elements as-is
     const isCoverSheet = detectCoverSheet(elements, drawing.filename);
-    if (isCoverSheet || scanned) {
-      const flags = [...pipelineFlags];
-      if (isCoverSheet) flags.push("COVER_SHEET");
-      if (scanned) flags.push("SCANNED");
-
+    if (isCoverSheet) {
       await prisma.drawing.update({
         where: { id },
         data: {
-          extractionStatus: isCoverSheet ? "cover_sheet" : "extracted",
-          documentType: isCoverSheet ? "cover_sheet" : "unknown",
+          extractionStatus: "cover_sheet",
+          documentType: "cover_sheet",
           pdfplumberRaw: JSON.stringify(elements),
-          flags: JSON.stringify(flags),
+          flags: JSON.stringify([...pipelineFlags, "COVER_SHEET"]),
           extractedAt: new Date(),
           pdfplumberTimeMs,
           processingTimeMs: Date.now() - pipelineStart,
         },
       });
-      return NextResponse.json({ status: isCoverSheet ? "cover_sheet" : "scanned", flags });
+      return NextResponse.json({ status: "cover_sheet", flags: [...pipelineFlags, "COVER_SHEET"] });
+    }
+
+    // ── Step 2.5: Vision fallback for scanned PDFs ────────────────
+    let useVision = false;
+    let visionImageBase64 = "";
+    if (scanned) {
+      pipelineFlags.push("SCANNED");
+      const imgResult = await renderPageAsImage(drawing.filepath, drawing.pageNumber);
+      if (!imgResult.error && imgResult.imageBase64) {
+        useVision = true;
+        visionImageBase64 = imgResult.imageBase64;
+        pipelineFlags.push("VISION_FALLBACK");
+      } else {
+        // Image rendering failed — can't extract, mark as scanned and return
+        await prisma.drawing.update({
+          where: { id },
+          data: {
+            extractionStatus: "extracted",
+            documentType: "unknown",
+            pdfplumberRaw: JSON.stringify(elements),
+            flags: JSON.stringify([...pipelineFlags, "VISION_RENDER_FAILED"]),
+            notes: imgResult.error ?? "Page rendered no image",
+            extractedAt: new Date(),
+            pdfplumberTimeMs,
+            processingTimeMs: Date.now() - pipelineStart,
+          },
+        });
+        return NextResponse.json({ status: "scanned", flags: [...pipelineFlags, "VISION_RENDER_FAILED"] });
+      }
     }
 
     // ── Step 3: Gemini extraction ─────────────────────────────────
-    const templateContext = await getTemplateContext(drawing.architectId);
+    const templateContext = await getTemplateContext(activeArchitectId);
     let geminiMetrics: GeminiCallMetrics | undefined;
 
     let geminiResult;
@@ -182,19 +236,24 @@ export async function POST(
       const rateDelay = parseInt(process.env.GEMINI_RATE_DELAY_MS || "200", 10);
       if (rateDelay > 0) await new Promise((r) => setTimeout(r, rateDelay));
 
-      const response = await extractWithGemini(elements, templateContext);
+      const response = useVision
+        ? await extractWithGeminiVision(visionImageBase64, "image/png", templateContext)
+        : await extractWithGemini(elements, templateContext);
       geminiResult = response.result;
       geminiMetrics = response.metrics;
+      if (response.inputTruncated) pipelineFlags.push("INPUT_TRUNCATED");
     } catch (err) {
       const errMetrics = (err as { metrics?: GeminiCallMetrics }).metrics;
       const errMsg = err instanceof Error ? err.message : String(err);
+      const isParseError = errMsg.includes("unparseable JSON");
+      const errorFlag = isParseError ? "GEMINI_PARSE_ERROR" : "GEMINI_API_ERROR";
 
       if (errMetrics) {
         await prisma.apiCall.create({
           data: {
             drawingId: id,
             model: process.env.GEMINI_MODEL || "gemini-2.5-flash",
-            callType: "extract",
+            callType: useVision ? "extract_vision" : (cropMode ? "extract_crop" : "extract"),
             inputTokens: errMetrics.usage.inputTokens,
             outputTokens: errMetrics.usage.outputTokens,
             thinkingTokens: errMetrics.usage.thinkingTokens,
@@ -214,7 +273,7 @@ export async function POST(
         data: {
           extractionStatus: "extracted",
           pdfplumberRaw: JSON.stringify(elements),
-          flags: JSON.stringify([...pipelineFlags, "GEMINI_PARSE_ERROR"]),
+          flags: JSON.stringify([...pipelineFlags, errorFlag]),
           notes: errMsg,
           extractedAt: new Date(),
           pdfplumberTimeMs,
@@ -230,34 +289,84 @@ export async function POST(
     // ── Step 4: Validation ────────────────────────────────────────
     const confidenceThreshold = parseFloat(process.env.CONFIDENCE_THRESHOLD || "0.7");
     const validated = await validateExtraction(geminiResult, confidenceThreshold);
+
+    // ── Step 4.1: Cross-validate Gemini output against source text ──
+    // Every field value must have textual evidence in the extracted elements.
+    // For Vision mode (no elements), applies confidence-based fallback rules.
+    crossValidateWithElements(validated, elements, geminiResult);
+
     const processingTimeMs = Date.now() - pipelineStart;
 
     // Merge pipeline flags into validated flags
     const allFlags = [...new Set([...pipelineFlags, ...validated.flags])];
 
-    // ── Step 4.5: Apply Manual BBox Overrides ─────────────────────
-    // For any field that was explicitly taught via bounding box selection, override the result.
-    const learnedBboxes = await getLearnedBboxRegions(drawing.architectId);
+    // ── Step 4.5: Apply BBox Overrides (fallback only) ────────────
+    // Gemini is the primary extractor. BBox overrides are applied only when Gemini
+    // returned low confidence (< threshold) or null for a field — i.e. Gemini could
+    // not confidently identify the value from context alone.
+    const learnedBboxes = await getLearnedBboxRegions(activeArchitectId);
     if (learnedBboxes) {
+      const fieldConfidenceMap: Record<string, number | null | undefined> = {
+        drawingNumber: validated.confidenceDrawingNumber,
+        drawingTitle: validated.confidenceDrawingTitle,
+        revision: validated.confidenceRevision,
+        revisionDate: validated.confidenceRevisionDate,
+        status: validated.confidenceStatus,
+        location: validated.confidenceLocation,
+      };
       for (const [field, bbox] of Object.entries(learnedBboxes)) {
-        const val = extractTextFromBbox(elements, bbox as BoundingBox);
-        if (val) {
-          const map: Record<string, keyof typeof validated> = {
-            drawingNumber: "drawingNumber",
-            drawingTitle: "drawingTitle",
-            revision: "revision",
-            revisionDate: "revisionDate",
-            status: "status",
-            location: "location",
-          };
-          const key = map[field];
-          if (key) {
-            // override the value
+        const map: Record<string, keyof typeof validated> = {
+          drawingNumber: "drawingNumber",
+          drawingTitle: "drawingTitle",
+          revision: "revision",
+          revisionDate: "revisionDate",
+          status: "status",
+          location: "location",
+        };
+        const key = map[field];
+        if (!key) continue;
+
+        const geminiConfidence = fieldConfidenceMap[field] ?? 0;
+        const geminiValue = (validated as any)[key];
+
+        // Only apply BBOX override if Gemini didn't extract the field confidently
+        if (!geminiValue || geminiConfidence < confidenceThreshold) {
+          const val = extractTextFromBbox(elements, bbox as BoundingBox);
+          if (val) {
             (validated as any)[key] = val;
-            // mark 1.0 confidence since it was manually defined
             (validated as any)[`confidence${key.charAt(0).toUpperCase() + key.slice(1)}`] = 1.0;
             allFlags.push(`BBOX_OVERRIDE_${key.toUpperCase()}`);
           }
+        }
+      }
+    }
+
+    // ── Step 4.6: Inject pipeline source into extractionRules ────────
+    // This is done after BBox overrides so we can accurately record the final source.
+    const pipelineSource = useVision ? "vision" : cropMode ? "crop_bbox" : "region";
+    const hasRevBlock =
+      validated.revisionBlockLocation !== "none" &&
+      validated.revisionBlockLocation !== "unknown" &&
+      validated.revisionBlockLocation !== null;
+    const revSource = hasRevBlock ? "revision_block" : pipelineSource;
+
+    validated.extractionRules.drawingNumber.source = pipelineSource;
+    validated.extractionRules.drawingTitle.source  = pipelineSource;
+    validated.extractionRules.revision.source      = revSource;
+    validated.extractionRules.revision.blockLocation = validated.revisionBlockLocation || undefined;
+    validated.extractionRules.revisionDate.source  = revSource;
+    validated.extractionRules.revisionDate.blockLocation = validated.revisionBlockLocation || undefined;
+    validated.extractionRules.status.source        = pipelineSource;
+
+    // Mark any BBox-overridden fields
+    for (const flag of allFlags) {
+      const m = flag.match(/^BBOX_OVERRIDE_(.+)$/);
+      if (m) {
+        const camel = m[1].toLowerCase().replace(/_([a-z])/g, (_: string, c: string) => c.toUpperCase());
+        const rule = (validated.extractionRules as Record<string, import("@/lib/validate-extraction").ExtractionFieldRule>)[camel];
+        if (rule) {
+          rule.source = "bbox_override";
+          if (!rule.transforms.includes("bbox_override")) rule.transforms.push("bbox_override");
         }
       }
     }
@@ -268,7 +377,7 @@ export async function POST(
         data: {
           drawingId: id,
           model: process.env.GEMINI_MODEL || "gemini-2.5-flash",
-          callType: cropMode ? "extract_crop" : "extract",
+          callType: useVision ? "extract_vision" : (cropMode ? "extract_crop" : "extract"),
           inputTokens: geminiMetrics.usage.inputTokens,
           outputTokens: geminiMetrics.usage.outputTokens,
           thinkingTokens: geminiMetrics.usage.thinkingTokens,
@@ -298,8 +407,13 @@ export async function POST(
       elements,
       projectId: drawing.project.id,
       projectName: drawing.project.name,
-      existingArchitectId: drawing.architectId,
+      existingArchitectId: activeArchitectId,
       geminiArchitectFirmName: geminiResult.architect_firm_name,
+      // Enriched fields for template metadata (Task 2)
+      revision: validated.revision,
+      revisionDate: validated.revisionDate,
+      revisionDateRaw: geminiResult.revision_date, // pre-normalisation value
+      status: validated.status,
     });
 
     const finalFlags = [...new Set([...allFlags, ...templateResult.flags])];
@@ -316,11 +430,13 @@ export async function POST(
         status: validated.status,
         location: validated.location,
         fieldCoordinates: validated.fieldCoordinates ? JSON.stringify(validated.fieldCoordinates) : null,
+        extractionRules: JSON.stringify(validated.extractionRules),
         confidenceDrawingNumber: validated.confidenceDrawingNumber,
         confidenceDrawingTitle: validated.confidenceDrawingTitle,
         confidenceRevision: validated.confidenceRevision,
         confidenceRevisionDate: validated.confidenceRevisionDate,
         confidenceStatus: validated.confidenceStatus,
+        confidenceLocation: validated.confidenceLocation,
         conflictDetected: validated.conflictDetected,
         conflictDetail: validated.conflictDetail,
         documentType: validated.documentType,

@@ -151,13 +151,13 @@ function InlineCell({
   return (
     <div
       onClick={() => setEditing(true)}
-      className={`flex items-center gap-1.5 px-1.5 py-0.5 rounded cursor-pointer hover:bg-gray-100 min-h-[28px] group ${cellClass}`}
+      className={`flex items-center gap-1.5 px-1.5 py-0.5 rounded cursor-pointer hover:bg-gray-100 min-h-[28px] min-w-0 group ${cellClass}`}
     >
       <ConfidenceDot value={confidence} />
-      <span className="text-sm truncate max-w-[160px]">
+      <span className="text-sm truncate">
         {value || <span className="text-gray-400 italic">—</span>}
       </span>
-      <span className="opacity-0 group-hover:opacity-100 text-gray-400 text-xs ml-auto">✎</span>
+      <span className="opacity-0 group-hover:opacity-100 text-gray-400 text-xs ml-auto shrink-0">✎</span>
     </div>
   );
 }
@@ -379,12 +379,17 @@ function DrawingSlideOver({
 
           {/* Fields table */}
           <div className="p-4">
-            <table className="w-full text-sm border-collapse">
+            <table className="w-full text-sm border-collapse table-fixed">
+              <colgroup>
+                <col style={{ width: "7rem" }} />
+                <col />
+                <col style={{ width: "3.5rem" }} />
+              </colgroup>
               <thead>
                 <tr className="text-xs text-gray-400 uppercase tracking-wide border-b border-gray-200">
-                  <th className="text-left py-1.5 pr-2 w-28">Field</th>
+                  <th className="text-left py-1.5 pr-2">Field</th>
                   <th className="text-left py-1.5 pr-2">Value</th>
-                  <th className="text-left py-1.5 w-12">Conf</th>
+                  <th className="text-left py-1.5">Conf</th>
                 </tr>
               </thead>
               <tbody>
@@ -396,8 +401,8 @@ function DrawingSlideOver({
 
                   return (
                     <tr key={row.field} className="border-b border-gray-100">
-                      <td className="py-2 pr-2 text-xs font-medium text-gray-700">{row.label}</td>
-                      <td className="py-2 pr-2 text-xs text-gray-900">
+                      <td className="py-2 pr-2 text-xs font-medium text-gray-700 overflow-hidden">{row.label}</td>
+                      <td className="py-2 pr-2 text-xs text-gray-900 overflow-hidden">
                         <InlineCell
                           value={rawVal}
                           confidence={null} // Suppress the dot, we render it explicitly in the next column
@@ -408,9 +413,9 @@ function DrawingSlideOver({
                           isCoverSheet={isCoverSheet}
                         />
                       </td>
-                      <td className="py-2">
-                        {conf !== null ? (
-                          <span className={`text-xs px-1.5 py-0.5 rounded ${conf >= 0.7 ? "bg-green-100 text-green-700" : conf >= 0.4 ? "bg-amber-100 text-amber-700" : "bg-red-100 text-red-700"}`}>
+                      <td className="py-2 overflow-hidden">
+                        {conf !== null && conf !== undefined ? (
+                          <span className={`text-xs px-1.5 py-0.5 rounded whitespace-nowrap ${conf >= 0.7 ? "bg-green-100 text-green-700" : conf >= 0.4 ? "bg-amber-100 text-amber-700" : "bg-red-100 text-red-700"}`}>
                             {(conf * 100).toFixed(0)}%
                           </span>
                         ) : <span className="text-xs text-gray-300">—</span>}
@@ -552,6 +557,45 @@ export default function ProjectPage() {
   const [dragOver, setDragOver] = useState(false);
   const [filter, setFilter] = useState<Filter>("all");
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // ── Column resize ──────────────────────────────────────────────────
+  const [colWidths, setColWidths] = useState<Record<string, number>>({
+    file: 180,
+    drawingNo: 120,
+    title: 340,
+    rev: 64,
+    revDate: 108,
+    status: 190,
+    state: 108,
+    actions: 96,
+  });
+  const resizingRef = useRef<{ col: string; startX: number; startWidth: number } | null>(null);
+
+  const startResize = useCallback((e: React.MouseEvent, col: string, currentWidth: number) => {
+    e.preventDefault();
+    e.stopPropagation();
+    resizingRef.current = { col, startX: e.clientX, startWidth: currentWidth };
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+
+    const onMove = (ev: MouseEvent) => {
+      if (!resizingRef.current) return;
+      const delta = ev.clientX - resizingRef.current.startX;
+      const newWidth = Math.max(50, resizingRef.current.startWidth + delta);
+      setColWidths(prev => ({ ...prev, [resizingRef.current!.col]: newWidth }));
+    };
+
+    const onUp = () => {
+      resizingRef.current = null;
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+    };
+
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("mouseup", onUp);
+  }, []);
 
   // Selection state
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
@@ -829,9 +873,18 @@ export default function ProjectPage() {
           <div className="text-center py-12 text-gray-400 text-sm">No drawings in this category.</div>
         ) : (
           <div className="overflow-x-auto">
-            <table className="w-full text-sm border-collapse">
+            <table
+              className="w-full text-sm border-collapse table-fixed"
+              style={{ minWidth: 640 }}
+            >
+              <colgroup>
+                <col style={{ width: 32 }} />
+                {(["file","drawingNo","title","rev","revDate","status","state","actions"] as const).map(k => (
+                  <col key={k} style={{ width: colWidths[k] }} />
+                ))}
+              </colgroup>
               <thead>
-                <tr className="border-b border-gray-200 text-xs text-gray-500 uppercase tracking-wide">
+                <tr className="border-b border-gray-200 text-xs text-gray-500 uppercase tracking-wide select-none">
                   <th className="text-left px-3 py-2 w-8">
                     <input
                       type="checkbox"
@@ -840,14 +893,29 @@ export default function ProjectPage() {
                       className="rounded border-gray-300"
                     />
                   </th>
-                  <th className="text-left px-3 py-2 font-medium">File</th>
-                  <th className="text-left px-3 py-2 font-medium">Drawing No</th>
-                  <th className="text-left px-3 py-2 font-medium">Title</th>
-                  <th className="text-left px-3 py-2 font-medium w-20">Rev</th>
-                  <th className="text-left px-3 py-2 font-medium w-28">Rev Date</th>
-                  <th className="text-left px-3 py-2 font-medium">Status</th>
-                  <th className="text-left px-3 py-2 font-medium w-24">State</th>
-                  <th className="text-left px-3 py-2 font-medium w-28">Actions</th>
+                  {(["file","drawingNo","title","rev","revDate","status","state","actions"] as const).map((col, i, arr) => {
+                    const labels: Record<string, string> = {
+                      file: "File", drawingNo: "Drawing No", title: "Title",
+                      rev: "Rev", revDate: "Rev Date", status: "Status",
+                      state: "State", actions: "Actions",
+                    };
+                    const isLast = i === arr.length - 1;
+                    return (
+                      <th
+                        key={col}
+                        className="relative text-left px-3 py-2 font-medium overflow-hidden whitespace-nowrap"
+                        style={{ width: colWidths[col] }}
+                      >
+                        {labels[col]}
+                        {!isLast && (
+                          <div
+                            className="absolute right-0 top-0 h-full w-1 cursor-col-resize z-10 hover:bg-blue-400/40 transition-colors"
+                            onMouseDown={(e) => startResize(e, col, colWidths[col])}
+                          />
+                        )}
+                      </th>
+                    );
+                  })}
                 </tr>
               </thead>
               <tbody>
@@ -870,35 +938,35 @@ export default function ProjectPage() {
                           className="rounded border-gray-300"
                         />
                       </td>
-                      <td className="px-3 py-2">
-                        <div className="flex items-center gap-1.5">
-                          {hasConflict && <span className="text-amber-500 text-xs" title="Revision conflict detected">⚠</span>}
-                          <span className="text-gray-700 truncate max-w-[140px]" title={`${d.filename} — page ${d.pageNumber + 1}`}>{d.filename}</span>
+                      <td className="px-3 py-2 overflow-hidden">
+                        <div className="flex items-center gap-1.5 min-w-0">
+                          {hasConflict && <span className="text-amber-500 text-xs shrink-0" title="Revision conflict detected">⚠</span>}
+                          <span className="text-gray-700 truncate" title={`${d.filename} — page ${d.pageNumber + 1}`}>{d.filename}</span>
                           <span className="text-xs text-gray-400 shrink-0">p.{d.pageNumber + 1}</span>
-                          {isCoverSheet && <span className="text-xs bg-purple-100 text-purple-700 px-1.5 py-0.5 rounded-full">cover</span>}
+                          {isCoverSheet && <span className="text-xs bg-purple-100 text-purple-700 px-1.5 py-0.5 rounded-full shrink-0">cover</span>}
                         </div>
                       </td>
-                      <td className="px-3 py-2">
+                      <td className="px-3 py-2 overflow-hidden">
                         <InlineCell value={d.drawingNumber} confidence={d.confidenceDrawingNumber} drawingId={d.id} field="drawingNumber" onSave={saveField} isNull={!d.drawingNumber && flags.includes("NEEDS_REVIEW")} isCoverSheet={isCoverSheet} />
                       </td>
-                      <td className="px-3 py-2">
+                      <td className="px-3 py-2 overflow-hidden">
                         <InlineCell value={d.drawingTitle} confidence={d.confidenceDrawingTitle} drawingId={d.id} field="drawingTitle" onSave={saveField} isNull={false} isCoverSheet={isCoverSheet} />
                       </td>
-                      <td className="px-3 py-2">
+                      <td className="px-3 py-2 overflow-hidden">
                         <InlineCell value={d.revision} confidence={d.confidenceRevision} drawingId={d.id} field="revision" onSave={saveField} isNull={false} isCoverSheet={isCoverSheet} />
                       </td>
-                      <td className="px-3 py-2">
+                      <td className="px-3 py-2 overflow-hidden">
                         <InlineCell value={d.revisionDate} confidence={d.confidenceRevisionDate} drawingId={d.id} field="revisionDate" onSave={saveField} isNull={false} isCoverSheet={isCoverSheet} />
                       </td>
-                      <td className="px-3 py-2">
+                      <td className="px-3 py-2 overflow-hidden">
                         <InlineCell value={d.status} confidence={d.confidenceStatus} drawingId={d.id} field="status" onSave={saveField} isNull={false} isCoverSheet={isCoverSheet} />
                       </td>
-                      <td className="px-3 py-2">
-                        <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${STATUS_COLORS[d.extractionStatus] || "bg-gray-100 text-gray-600"}`}>
+                      <td className="px-3 py-2 overflow-hidden">
+                        <span className={`text-xs px-2 py-0.5 rounded-full font-medium whitespace-nowrap ${STATUS_COLORS[d.extractionStatus] || "bg-gray-100 text-gray-600"}`}>
                           {STATUS_LABELS[d.extractionStatus] || d.extractionStatus}
                         </span>
                       </td>
-                      <td className="px-3 py-2">
+                      <td className="px-3 py-2 overflow-hidden">
                         <div className="flex items-center gap-1">
                           <button
                             onClick={() => setViewingDrawingId(d.id)}

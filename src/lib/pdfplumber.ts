@@ -3,8 +3,10 @@ import path from "path";
 
 export interface TextElement {
   text: string;
-  x: number;
-  y: number;
+  x: number;       // left edge (x0) in PDF points
+  y: number;       // top edge in PDF points (top-left origin)
+  x1?: number;     // right edge in PDF points (present on newly extracted drawings)
+  bottom?: number; // bottom edge in PDF points (present on newly extracted drawings)
   size: number;
   page_width: number;
   page_height: number;
@@ -37,7 +39,7 @@ function resolvePdfPath(pdfPath: string): string {
     : path.join(process.cwd(), pdfPath);
 }
 
-function runPython(args: string[]): Promise<string> {
+function runPython(args: string[], timeoutMs = 240_000): Promise<string> {
   const scriptPath = path.join(process.cwd(), "scripts", "extract_text.py");
   const pythonCmd = process.platform === "win32" ? "py" : "python3";
 
@@ -46,10 +48,16 @@ function runPython(args: string[]): Promise<string> {
     let stdout = "";
     let stderr = "";
 
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      reject(new Error(`Python process timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+
     child.stdout.on("data", (d) => { stdout += d.toString(); });
     child.stderr.on("data", (d) => { stderr += d.toString(); });
-    child.on("error", (err) => reject(new Error(`Failed to run Python: ${err.message}`)));
+    child.on("error", (err) => { clearTimeout(timer); reject(new Error(`Failed to run Python: ${err.message}`)); });
     child.on("close", (code) => {
+      clearTimeout(timer);
       if (code !== 0) reject(new Error(stderr || `Python exited with code ${code}`));
       else resolve(stdout.trim());
     });
@@ -165,5 +173,36 @@ export async function extractTextFromCrop(
       pageHeight: 0,
       cropBbox: [bbox.x0, bbox.y0, bbox.x1, bbox.y1],
     };
+  }
+}
+
+export interface PdfPlumberImageResult {
+  imageBase64: string;
+  width: number;
+  height: number;
+  error?: string;
+}
+
+/** Renders a PDF page as a base64 PNG for Gemini Vision fallback (scanned PDFs). */
+export async function renderPageAsImage(
+  pdfPath: string,
+  pageIndex = 0,
+  resolution = 150
+): Promise<PdfPlumberImageResult> {
+  const absolutePath = resolvePdfPath(pdfPath);
+  try {
+    const output = await runPython(
+      [absolutePath, String(pageIndex), "--image", String(resolution)],
+      60_000 // allow up to 60s for image rendering
+    );
+    const result = JSON.parse(output) as { image_base64: string; width: number; height: number };
+    return {
+      imageBase64: result.image_base64,
+      width: result.width,
+      height: result.height,
+    };
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    return { imageBase64: "", width: 0, height: 0, error: errMsg };
   }
 }

@@ -8,7 +8,7 @@ export async function POST(
   { params }: { params: Promise<{ id: string }> }
 ) {
   const { id } = await params;
-  
+
   try {
     const body = await req.json();
     const { fieldName, bbox } = body as { fieldName: string; bbox: BoundingBox };
@@ -29,79 +29,97 @@ export async function POST(
 
     let matchedDrawingsCount = 0;
     const matchedDrawingIds: string[] = [];
-    
-    // Attempt to extract for the current drawing
+
+    // Attempt to extract a value for the current drawing
     let extractedValue: string | null = null;
     let debugInfo = "";
+    let usedVision = false;
 
-    if (drawing.pdfplumberRaw) {
-      const elements: TextElement[] = JSON.parse(drawing.pdfplumberRaw);
-      extractedValue = extractTextFromBbox(elements, bbox);
-      
-      if (!extractedValue) {
-        const near = elements.filter(el => 
-          el.x >= bbox.x0 - 50 && el.x <= bbox.x1 + 50 &&
-          el.y >= bbox.y0 - 50 && el.y <= bbox.y1 + 50
-        );
-        debugInfo = JSON.stringify({ bbox, count: elements.length, nearElements: near.map(n => ({t: n.text, x: n.x, y: n.y})) }, null, 2);
-      }
-    }
-
-    // Fallback: If no text layer value was found AND we have an image crop (i.e. scanned PDF), use Gemini Vision
-    if (!extractedValue && imageBase64) {
+    // ── PRIMARY: Gemini Vision on the canvas crop ──────────────────────────────
+    // The canvas crop is pixel-accurate (captures exactly what the user selected).
+    // Using Vision here avoids coordinate-system mismatches and margin errors that
+    // cause pdfplumber text-layer matching to bleed into adjacent title block columns.
+    if (imageBase64) {
       try {
-        const { GoogleGenerativeAI } = require("@google/generative-ai");
-        const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
-        const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
+        const { GoogleGenerativeAI } = await import("@google/generative-ai");
+        const apiKey = process.env.GOOGLE_GEMINI_API_KEY;
+        if (!apiKey) throw new Error("GOOGLE_GEMINI_API_KEY not set");
+        const modelName = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+        const genAI = new GoogleGenerativeAI(apiKey);
+        const model = genAI.getGenerativeModel({ model: modelName });
         const base64Data = imageBase64.replace(/^data:image\/(png|jpeg|jpg);base64,/, "");
-        const prompt = "Extract exactly the text visible in this cropped image snippet. Do not include any extra words, markdown formatting, or explanation. Just return the literal text string as closely as possible. If it is empty, return nothing.";
-        
+        const mimeType =
+          imageBase64.startsWith("data:image/jpeg") || imageBase64.startsWith("data:image/jpg")
+            ? ("image/jpeg" as const)
+            : ("image/png" as const);
+
+        // Field-aware prompt so Gemini returns only the relevant text.
+        const fieldLabel = fieldName
+          .replace(/([A-Z])/g, " $1")
+          .replace(/^./, (c) => c.toUpperCase())
+          .trim();
+        const prompt =
+          `You are reading a cropped image from a construction drawing title block. ` +
+          `The region shown is the "${fieldLabel}" field. ` +
+          `Return ONLY the exact text visible in this region — no explanation, no markdown, ` +
+          `no extra words. If the region appears blank, return nothing.`;
+
         const result = await model.generateContent([
           prompt,
-          { inlineData: { data: base64Data, mimeType: "image/jpeg" } }
+          { inlineData: { data: base64Data, mimeType } },
         ]);
-        
+
         const text = result.response.text()?.trim();
         if (text) {
           extractedValue = text;
-          debugInfo = "Extracted via Gemini Vision fallback " + debugInfo;
-          
-          // Since we can't mathematically cross-check scanned drawings, 
-          // we treat all unextracted scanned drawings in this project as "matches"
-          // so the user can choose to bulk-apply the new AI template rule to them.
-          const otherDrawings = await prisma.drawing.findMany({
-            where: {
-              projectId: drawing.projectId,
-              id: { not: id },
-              // Find drawings that might need this fallback rule
-              OR: [
-                { pdfplumberRaw: { equals: "[]" } },
-                { pdfplumberRaw: null }
-              ]
-            },
-            select: { id: true }
-          });
-          
-          otherDrawings.forEach(d => matchedDrawingIds.push(d.id));
+          usedVision = true;
+          debugInfo = "Extracted via Gemini Vision (primary)";
         }
       } catch (geminiErr) {
-        console.error("OCR fallback failed:", geminiErr);
+        console.error("Vision extraction failed, falling back to pdfplumber:", geminiErr);
       }
     }
 
-    // If we successfully got a value, cross-check other drawings in the same project
+    // ── FALLBACK: pdfplumber text layer ────────────────────────────────────────
+    // Used when: (a) no canvas crop was provided, or (b) Vision returned nothing.
+    if (!extractedValue && drawing.pdfplumberRaw) {
+      const elements: TextElement[] = JSON.parse(drawing.pdfplumberRaw);
+      extractedValue = extractTextFromBbox(elements, bbox);
+
+      if (!extractedValue) {
+        const near = elements.filter(
+          (el) =>
+            el.x >= bbox.x0 - 50 &&
+            el.x <= bbox.x1 + 50 &&
+            el.y >= bbox.y0 - 50 &&
+            el.y <= bbox.y1 + 50
+        );
+        debugInfo = JSON.stringify(
+          { bbox, count: elements.length, nearElements: near.map((n) => ({ t: n.text, x: n.x, y: n.y })) },
+          null,
+          2
+        );
+      }
+    }
+
+    // For scanned drawings where Vision provided the value, offer all other scanned drawings
+    // in this project as candidates for bulk-apply.
+    if (usedVision && extractedValue) {
+      const scannedDrawings = await prisma.drawing.findMany({
+        where: {
+          projectId: drawing.projectId,
+          id: { not: id },
+          OR: [{ pdfplumberRaw: { equals: "[]" } }, { pdfplumberRaw: null }],
+        },
+        select: { id: true },
+      });
+      scannedDrawings.forEach((d) => matchedDrawingIds.push(d.id));
+    }
+
+    // ── Cross-check other drawings using pdfplumber (fast, no extra API calls) ──
+    // Even when Vision provided the current drawing's value, we scan other drawings
+    // with pdfplumber to identify which ones have text at this same location.
     if (extractedValue !== null) {
-      const dbFieldMap: Record<string, keyof typeof prisma.drawing.fields> = {
-        drawingNumber: "drawingNumber",
-        drawingTitle: "drawingTitle",
-        revision: "revision",
-        revisionDate: "revisionDate",
-        status: "status",
-        location: "location",
-      };
-      
-      const dbField = dbFieldMap[fieldName];
-      
       const otherDrawings = await prisma.drawing.findMany({
         where: {
           projectId: drawing.projectId,
@@ -114,29 +132,21 @@ export async function POST(
         },
       });
 
-      // Because 'pdfplumberRaw' is quite large, scanning in-memory might take a moment 
-      // but it's drastically faster than running a Python sub-process per drawing.
       for (const other of otherDrawings) {
         if (!other.pdfplumberRaw || other.pdfplumberRaw === "[]") continue;
-        
+
         const otherElements: TextElement[] = JSON.parse(other.pdfplumberRaw);
         if (otherElements.length === 0) continue;
 
-        const otherExtractedValue = extractTextFromBbox(otherElements, bbox);
-        
-        // As long as we extract *something* from that exact coordinate in the other drawings,
-        // we count it as a match (e.g. text was at least found there).
-        // The user will be given the option to overwrite all these matching drawings.
-        if (otherExtractedValue) {
-          // You could optionally filter out if the current DB value already equals the extracted value,
-          // but offering a bulk overwrite is safer.
-          // Don't push duplicate ID if it was already added by scanned matching
-          if (!matchedDrawingIds.includes(other.id)) {
-            matchedDrawingIds.push(other.id);
-          }
+        // Use a larger margin (15px) when scanning other drawings — minor coordinate
+        // shifts between drawings from the same architect are common, and we want to
+        // offer bulk-apply for as many drawings as possible.
+        const otherExtractedValue = extractTextFromBbox(otherElements, bbox, 15);
+        if (otherExtractedValue && !matchedDrawingIds.includes(other.id)) {
+          matchedDrawingIds.push(other.id);
         }
       }
-      
+
       matchedDrawingsCount = matchedDrawingIds.length;
     }
 
@@ -145,9 +155,8 @@ export async function POST(
       matchedDrawingsCount,
       matchedDrawingIds,
       architectId: drawing.architectId,
-      debugInfo
+      debugInfo,
     });
-
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err);
     return NextResponse.json({ error: errMsg }, { status: 500 });

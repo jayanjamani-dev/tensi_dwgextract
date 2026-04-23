@@ -14,14 +14,28 @@ export async function PATCH(
     "revisionColumnOrder",
     "revisionReadingDirection",
     "fieldLabelMap",
+    "valueReplacements",
+    "learnedRules",
+    // Enriched format intelligence fields (Task 2)
+    "drawingNumberFormatDesc",
+    "drawingTitleConventions",
+    "revisionNumberFormat",
+    "revisionDateFormat",
+    "statusTerminology",
   ];
+
+  const jsonFields = new Set(["revisionColumnOrder", "fieldLabelMap", "valueReplacements", "learnedRules", "statusTerminology"]);
 
   const data: Record<string, unknown> = { lastUpdated: new Date() };
   for (const field of updatable) {
     if (field in body) {
-      // Store JSON fields as strings
-      if (field === "revisionColumnOrder" || field === "fieldLabelMap") {
-        data[field] = typeof body[field] === "string" ? body[field] : JSON.stringify(body[field]);
+      if (jsonFields.has(field)) {
+        // Accept null (to clear the field), or store as JSON string
+        if (body[field] === null) {
+          data[field] = null;
+        } else {
+          data[field] = typeof body[field] === "string" ? body[field] : JSON.stringify(body[field]);
+        }
       } else {
         data[field] = body[field];
       }

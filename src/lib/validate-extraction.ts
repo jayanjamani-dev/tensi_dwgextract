@@ -1,4 +1,5 @@
 import { GeminiExtractionResult, FieldCoordinate } from "./gemini";
+import type { TextElement } from "./pdfplumber";
 
 export interface FieldCoordinates {
   drawing_number: FieldCoordinate | null;
@@ -7,6 +8,25 @@ export interface FieldCoordinates {
   revision_date: FieldCoordinate | null;
   status: FieldCoordinate | null;
   location: FieldCoordinate | null;
+}
+
+export interface ExtractionFieldRule {
+  /** Where the value came from — filled by the extract route after validateExtraction */
+  source?: string;             // "crop_bbox" | "region" | "vision" | "revision_block" | "bbox_override"
+  blockLocation?: string;      // revisionBlockLocation, for revision / revisionDate fields
+  transforms: string[];        // e.g. ["newlines_collapsed", "date_normalised", "status_normalised"]
+  validation: "passed" | "failed" | "flagged";
+  rawValue?: string;           // pre-normalisation Gemini value (dates, status)
+  normalisedFormat?: string;   // revisionDate: detected input format e.g. "DD/MM/YY"
+  canonical?: string;          // status: the canonical value mapped to
+}
+
+export interface ExtractionRules {
+  drawingNumber: ExtractionFieldRule;
+  drawingTitle:  ExtractionFieldRule;
+  revision:      ExtractionFieldRule;
+  revisionDate:  ExtractionFieldRule;
+  status:        ExtractionFieldRule;
 }
 
 export interface ValidationResult {
@@ -22,6 +42,7 @@ export interface ValidationResult {
   confidenceRevision: number;
   confidenceRevisionDate: number;
   confidenceStatus: number;
+  confidenceLocation: number;
   conflictDetected: boolean;
   conflictDetail: string | null;
   documentType: string;
@@ -29,6 +50,7 @@ export interface ValidationResult {
   revisionBlockLocation: string;
   flags: string[];
   notes: string | null;
+  extractionRules: ExtractionRules;
 }
 
 import { prisma } from "./db";
@@ -45,14 +67,137 @@ async function getStatusNormalisationRules(): Promise<Record<string, string>> {
   }
 }
 
+/**
+ * Hardcoded canonical status map — exhaustive, deterministic.
+ * Keys are lowercase trimmed variants; values are the canonical display string.
+ * DB STATUS_NORMALISATION rules can supplement but never override this map.
+ */
+const CANONICAL_STATUS: Record<string, string> = {
+  // Construction Issue
+  "construction issue":                  "Construction Issue",
+  "issued for construction":             "Construction Issue",
+  "issue for construction":              "Construction Issue",
+  "for construction":                    "Construction Issue",
+  "for construction (fc)":              "Construction Issue",
+  "construction":                        "Construction Issue",
+  "ifc":                                 "Construction Issue",
+  "fc":                                  "Construction Issue",
+  "cd issue":                            "Construction Issue",
+  "construction d&c":                    "Construction Issue",
+  "issued construction":                 "Construction Issue",
+
+  // Preliminary Construction Issue
+  "preliminary construction issue":      "Preliminary Construction Issue",
+  "pci":                                 "Preliminary Construction Issue",
+  "preliminary ifc":                     "Preliminary Construction Issue",
+
+  // Tender Issue
+  "tender issue":                        "Tender Issue",
+  "issued for tender":                   "Tender Issue",
+  "for tender":                          "Tender Issue",
+  "ift":                                 "Tender Issue",
+  "tender":                              "Tender Issue",
+  "tender d&c":                          "Tender Issue",
+  "tender documentation":                "Tender Issue",
+  "revised tender issue":                "Tender Issue",
+  "tenderable":                          "Tender Issue",
+  "pre-tender issue":                    "Tender Issue",
+
+  // Preliminary
+  "preliminary":                         "Preliminary",
+  "preliminary issue":                   "Preliminary",
+  "sketch design":                       "Preliminary",
+  "draft":                               "Preliminary",
+  "preliminary d&c":                     "Preliminary",
+
+  // Design Development
+  "design development":                  "Design Development",
+  "dd":                                  "Design Development",
+
+  // For Approval
+  "for approval":                        "For Approval",
+  "approval":                            "For Approval",
+  "ifa":                                 "For Approval",
+  "approved":                            "For Approval",
+  "approved as noted":                   "For Approval",
+  "aan":                                 "For Approval",
+
+  // For Review
+  "for review":                          "For Review",
+  "issue for review":                    "For Review",
+  "issued for review":                   "For Review",
+  "ifr":                                 "For Review",
+
+  // For Information Only
+  "for information only":                "For Information Only",
+  "for information":                     "For Information Only",
+  "for info":                            "For Information Only",
+  "fi":                                  "For Information Only",
+  "for information only not for construction": "For Information Only",
+
+  // For Coordination
+  "for coordination":                    "For Coordination",
+  "coordination issue":                  "For Coordination",
+
+  // For Pricing
+  "for pricing":                         "For Pricing",
+
+  // For Building Approval (generic council building approval)
+  "for building approval":               "For Building Approval",
+  "building approval":                   "For Building Approval",
+
+  // For Building Permit (BP Issue — different jurisdiction/permit type)
+  "building permit issue":               "For Building Permit",
+  "bp issue":                            "For Building Permit",
+  "for building permit":                 "For Building Permit",
+
+  // For CDC Approval (NSW Complying Development Certificate — legally distinct)
+  "for cdc approval":                    "For CDC Approval",
+  "cdc approval":                        "For CDC Approval",
+  "cdc":                                 "For CDC Approval",
+  "cdc issue":                           "For CDC Approval",
+
+  // Not for Construction
+  "not for construction":                "Not for Construction",
+  "nfc":                                 "Not for Construction",
+
+  // As Built / As Installed
+  "as built":                            "As Built",
+  "as-built":                            "As Built",
+  "as installed":                        "As Installed",
+  "as-installed":                        "As Installed",
+
+  // Working Drawing
+  "working drawing":                     "Working Drawing",
+
+  // Superseded / Void
+  "superseded":                          "Superseded",
+  "void":                                "Void",
+
+  // Schematic Design
+  "schematic design":                    "Schematic Design",
+  "sd":                                  "Schematic Design",
+};
+
 async function normaliseStatus(raw: string | null): Promise<string | null> {
   if (!raw) return null;
   const key = raw.toLowerCase().trim();
+
+  // Hardcoded map first — deterministic, exhaustive
+  if (key in CANONICAL_STATUS) return CANONICAL_STATUS[key];
+
+  // DB rules as supplement for project-specific overrides
   const rules = await getStatusNormalisationRules();
-  return rules[key] ?? raw;
+  if (key in rules) {
+    const mapped = rules[key].toLowerCase().trim();
+    // Re-run through canonical map in case DB rule points to a variant
+    return CANONICAL_STATUS[mapped] ?? rules[key];
+  }
+
+  return raw;
 }
 
-function normaliseDate(raw: string | null): { value: string | null; confidence?: number; flagged: boolean } {
+function normaliseDate(raw: string | null): { value: string | null; confidence?: number; flagged: boolean; format?: string } {
   if (!raw) return { value: null, flagged: false };
 
   const cleaned = raw.trim().replace(/_/g, "-").replace(/\\/g, "/");
@@ -60,37 +205,39 @@ function normaliseDate(raw: string | null): { value: string | null; confidence?:
   // Already DD/MM/YYYY
   if (/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/.test(cleaned)) {
     const m = cleaned.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
-    if (m) return { value: `${m[1].padStart(2, "0")}/${m[2].padStart(2, "0")}/${m[3]}`, flagged: false };
+    if (m) return { value: `${m[1].padStart(2, "0")}/${m[2].padStart(2, "0")}/${m[3]}`, flagged: false, format: "DD/MM/YYYY" };
   }
 
   // DD/MM/YY → assume 2000s
   const dmyShort = cleaned.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2})$/);
-  if (dmyShort) return { value: `${dmyShort[1].padStart(2, "0")}/${dmyShort[2].padStart(2, "0")}/20${dmyShort[3]}`, flagged: false };
+  if (dmyShort) return { value: `${dmyShort[1].padStart(2, "0")}/${dmyShort[2].padStart(2, "0")}/20${dmyShort[3]}`, flagged: false, format: "DD/MM/YY" };
 
   // DD.MM.YY or DD.MM.YYYY
   const dotFormat = cleaned.match(/^(\d{1,2})\.(\d{1,2})\.(\d{2,4})$/);
   if (dotFormat) {
     const year = dotFormat[3].length === 2 ? `20${dotFormat[3]}` : dotFormat[3];
-    return { value: `${dotFormat[1].padStart(2, "0")}/${dotFormat[2].padStart(2, "0")}/${year}`, flagged: false };
+    const fmt = dotFormat[3].length === 2 ? "DD.MM.YY" : "DD.MM.YYYY";
+    return { value: `${dotFormat[1].padStart(2, "0")}/${dotFormat[2].padStart(2, "0")}/${year}`, flagged: false, format: fmt };
   }
 
   // DD-MM-YYYY or DD-MM-YY
   const dashFormat = cleaned.match(/^(\d{1,2})-(\d{1,2})-(\d{2,4})$/);
   if (dashFormat) {
     const year = dashFormat[3].length === 2 ? `20${dashFormat[3]}` : dashFormat[3];
-    return { value: `${dashFormat[1].padStart(2, "0")}/${dashFormat[2].padStart(2, "0")}/${year}`, flagged: false };
+    const fmt = dashFormat[3].length === 2 ? "DD-MM-YY" : "DD-MM-YYYY";
+    return { value: `${dashFormat[1].padStart(2, "0")}/${dashFormat[2].padStart(2, "0")}/${year}`, flagged: false, format: fmt };
   }
 
   // YYYY-MM-DD or YYYY.MM.DD or YYYY/MM/DD
   const isoFormat = cleaned.match(/^(\d{4})[-./](\d{1,2})[-./](\d{1,2})$/);
   if (isoFormat) {
-    return { value: `${isoFormat[3].padStart(2, "0")}/${isoFormat[2].padStart(2, "0")}/${isoFormat[1]}`, flagged: false };
+    return { value: `${isoFormat[3].padStart(2, "0")}/${isoFormat[2].padStart(2, "0")}/${isoFormat[1]}`, flagged: false, format: "YYYY-MM-DD" };
   }
 
   // DD/MM only (no year)
   if (/^(\d{1,2})\/(\d{1,2})$/.test(cleaned)) {
     const m = cleaned.match(/^(\d{1,2})\/(\d{1,2})$/);
-    if (m) return { value: `${m[1].padStart(2, "0")}/${m[2].padStart(2, "0")}`, confidence: 0.6, flagged: false };
+    if (m) return { value: `${m[1].padStart(2, "0")}/${m[2].padStart(2, "0")}`, confidence: 0.6, flagged: false, format: "DD/MM" };
   }
 
   // Month YY (e.g. "Nov 25", "FEB 2026", "NOV 24", "Nov-25")
@@ -104,7 +251,7 @@ function normaliseDate(raw: string | null): { value: string | null; confidence?:
     if (mm) {
       const yearRaw = monthYear[2];
       const year = yearRaw.length === 2 ? `20${yearRaw}` : yearRaw;
-      return { value: `01/${mm}/${year}`, confidence: 0.7, flagged: false };
+      return { value: `01/${mm}/${year}`, confidence: 0.7, flagged: false, format: "Mon YY" };
     }
   }
 
@@ -114,23 +261,46 @@ function normaliseDate(raw: string | null): { value: string | null; confidence?:
     const dd = String(fullDate.getDate()).padStart(2, "0");
     const mm = String(fullDate.getMonth() + 1).padStart(2, "0");
     const yyyy = fullDate.getFullYear();
-    return { value: `${dd}/${mm}/${yyyy}`, flagged: false };
+    return { value: `${dd}/${mm}/${yyyy}`, flagged: false, format: "natural language" };
   }
 
   // Unparseable — strip alpha characters to get base date, but flag it
   const numericData = cleaned.replace(/[^0-9/.-]/g, "");
   if (numericData.length >= 6) {
-    return { value: numericData, confidence: 0.4, flagged: true };
+    return { value: numericData, confidence: 0.4, flagged: true, format: "unknown" };
   }
 
-  return { value: cleaned, flagged: true };
+  return { value: cleaned, flagged: true, format: "unknown" };
+}
+
+/** Normalize drawing title: collapse newlines to spaces, strip extra whitespace. */
+function cleanDrawingTitle(title: string | null): string | null {
+  if (!title) return null;
+  const cleaned = title
+    .replace(/[\r\n]+/g, " ") // newlines → single space
+    .replace(/\s+/g, " ")     // collapse multiple spaces
+    .trim();
+  return cleaned || null;
+}
+
+/** Return true if a drawing number looks like a real identifier (not a title). */
+function looksLikeDrawingNumber(drawingNumber: string | null): boolean {
+  if (!drawingNumber) return false;
+  // Drawing numbers must not contain newlines
+  if (/[\r\n]/.test(drawingNumber)) return false;
+  // Drawing numbers are short — if more than 30 chars it's probably a title
+  if (drawingNumber.length > 30) return false;
+  // If it contains more than 2 spaces, it reads like a sentence, not an identifier
+  const spaceCount = (drawingNumber.match(/ /g) || []).length;
+  if (spaceCount > 2) return false;
+  return true;
 }
 
 function cleanDrawingNumber(
   drawingNumber: string | null,
   revision: string | null
-): { drawingNumber: string | null; revision: string | null } {
-  if (!drawingNumber) return { drawingNumber, revision };
+): { drawingNumber: string | null; revision: string | null; bulletStripped: boolean } {
+  if (!drawingNumber) return { drawingNumber, revision, bulletStripped: false };
 
   // Strip bullet suffix (e.g. A000•B → A000, revision: B)
   const bulletMatch = drawingNumber.match(/^(.+)[•·]([A-Z]\d*)$/);
@@ -138,10 +308,256 @@ function cleanDrawingNumber(
     return {
       drawingNumber: bulletMatch[1].trim(),
       revision: revision || bulletMatch[2],
+      bulletStripped: true,
     };
   }
 
-  return { drawingNumber: drawingNumber.trim(), revision };
+  return { drawingNumber: drawingNumber.trim(), revision, bulletStripped: false };
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// CROSS-VALIDATION: Verify Gemini output against source text evidence
+// ═══════════════════════════════════════════════════════════════════
+
+/** Build a lowercase text corpus by joining all element texts. */
+function buildCorpus(elements: TextElement[]): string {
+  return elements.map((e) => e.text.toLowerCase().trim()).join(" ");
+}
+
+/**
+ * Check if any known status vocabulary term appears in the source elements.
+ * Returns the matching term if found, null otherwise.
+ */
+function findStatusInElements(elements: TextElement[]): string | null {
+  if (elements.length === 0) return null;
+  const corpus = buildCorpus(elements);
+
+  // Check multi-word phrases first (longest match wins)
+  const sortedKeys = Object.keys(CANONICAL_STATUS).sort((a, b) => b.length - a.length);
+  for (const key of sortedKeys) {
+    if (key.length >= 3 && corpus.includes(key)) return key;
+  }
+  return null;
+}
+
+/**
+ * Check if a specific text value appears in the source elements.
+ * Tries exact match, then case-insensitive substring match.
+ */
+function valueExistsInElements(value: string | null, elements: TextElement[]): boolean {
+  if (!value || elements.length === 0) return false;
+  const needle = value.toLowerCase().trim();
+  // Check individual elements first (exact match on a single element)
+  for (const el of elements) {
+    if (el.text.toLowerCase().trim() === needle) return true;
+    if (el.text.toLowerCase().trim().includes(needle)) return true;
+  }
+  // Check corpus (value may span multiple elements)
+  const corpus = buildCorpus(elements);
+  return corpus.includes(needle);
+}
+
+/**
+ * Check if a date string (in various formats) appears in elements.
+ * Tries multiple zero-padding variants and separator styles.
+ * Example: "01/06/2023" in Gemini output should match "1/6/2023" in elements.
+ */
+function dateExistsInElements(rawDate: string | null, normalisedDate: string | null, elements: TextElement[]): boolean {
+  if (elements.length === 0) return false;
+  // Try raw Gemini value and normalised value directly
+  if (rawDate && valueExistsInElements(rawDate, elements)) return true;
+  if (normalisedDate && valueExistsInElements(normalisedDate, elements)) return true;
+
+  // Parse the date into day/month/year, then try all padding/separator variants
+  const dateStr = normalisedDate || rawDate;
+  if (!dateStr) return false;
+  const parts = dateStr.match(/(\d{1,2})[/.\\-](\d{1,2})[/.\\-](\d{2,4})/);
+  if (!parts) return false;
+
+  const [, dayRaw, monthRaw, yearRaw] = parts;
+  const dayNum = parseInt(dayRaw, 10);
+  const monthNum = parseInt(monthRaw, 10);
+  const dayUnpadded = String(dayNum);
+  const dayPadded = String(dayNum).padStart(2, "0");
+  const monthUnpadded = String(monthNum);
+  const monthPadded = String(monthNum).padStart(2, "0");
+  const year2 = yearRaw.length === 4 ? yearRaw.slice(2) : yearRaw;
+  const year4 = yearRaw.length === 2 ? `20${yearRaw}` : yearRaw;
+
+  const corpus = buildCorpus(elements);
+
+  // Build all plausible date variants and check each against the corpus
+  const separators = ["/", ".", "-"];
+  const dayVariants = [dayUnpadded, dayPadded];
+  const monthVariants = [monthUnpadded, monthPadded];
+  const yearVariants = [year4, year2];
+
+  for (const sep of separators) {
+    for (const d of dayVariants) {
+      for (const m of monthVariants) {
+        for (const y of yearVariants) {
+          if (corpus.includes(`${d}${sep}${m}${sep}${y}`)) return true;
+        }
+      }
+    }
+  }
+
+  // Month name variants (e.g. "Jan 2023", "15 Jan 2023")
+  const monthNames = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+  const monthIdx = monthNum - 1;
+  if (monthIdx >= 0 && monthIdx < 12) {
+    const monName = monthNames[monthIdx];
+    if (corpus.includes(`${monName} ${year4}`) || corpus.includes(`${monName} ${year2}`)) return true;
+    if (corpus.includes(`${dayUnpadded} ${monName} ${year4}`)) return true;
+    if (corpus.includes(`${dayPadded} ${monName} ${year4}`)) return true;
+  }
+
+  return false;
+}
+
+/**
+ * Detect suspiciously generic dates that suggest a creation date rather than a revision date.
+ * Example: "01/01/2010" (first day of year) is often a drawing date, not a revision date.
+ */
+function isSuspiciousDate(dateStr: string | null): boolean {
+  if (!dateStr) return false;
+  const m = dateStr.match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
+  if (!m) return false;
+  const [, day, month] = m;
+  // First day of month is suspicious (often means only month+year were visible, day defaulted to 01)
+  if (day === "01" && month === "01") return true; // Jan 1st — very suspicious
+  return false;
+}
+
+/**
+ * Cross-validate Gemini extraction output against source text elements.
+ *
+ * Rule: Every field value must have textual evidence in the raw extracted elements.
+ * If a value is not supported by the source text, it is nulled out and flagged.
+ *
+ * For Vision-mode (no elements), applies confidence-based rules instead.
+ *
+ * Mutates `validated` in place.
+ */
+export function crossValidateWithElements(
+  validated: ValidationResult,
+  elements: TextElement[],
+  raw: GeminiExtractionResult
+): void {
+  const isVisionMode = elements.length === 0;
+
+  // ── STATUS ─────────────────────────────────────────────────────────
+  if (validated.status) {
+    if (!isVisionMode) {
+      // Text mode: status must appear as vocabulary in elements
+      const found = findStatusInElements(elements);
+      if (!found) {
+        validated.extractionRules.status.validation = "failed";
+        validated.extractionRules.status.transforms.push("nulled_no_text_evidence");
+        validated.flags.push("STATUS_NOT_IN_TEXT");
+        validated.status = null;
+        validated.confidenceStatus = 0;
+      }
+    } else {
+      // Vision mode: require HIGH confidence — Gemini Vision confidently hallucinates status.
+      // 0.9 threshold: only accept when Gemini is very sure (large clear stamp visible).
+      if (validated.confidenceStatus < 0.9) {
+        validated.extractionRules.status.validation = "failed";
+        validated.extractionRules.status.transforms.push("nulled_low_confidence_vision");
+        validated.flags.push("STATUS_LOW_CONFIDENCE_VISION");
+        validated.status = null;
+        validated.confidenceStatus = 0;
+      }
+    }
+  }
+
+  // ── REVISION DATE ──────────────────────────────────────────────────
+  if (validated.revisionDate) {
+    if (!isVisionMode) {
+      // Text mode: date value must appear somewhere in the elements
+      const dateFound = dateExistsInElements(raw.revision_date, validated.revisionDate, elements);
+      if (!dateFound) {
+        validated.extractionRules.revisionDate.validation = "failed";
+        validated.extractionRules.revisionDate.transforms.push("nulled_no_text_evidence");
+        validated.flags.push("REVISION_DATE_NOT_IN_TEXT");
+        validated.revisionDate = null;
+        validated.confidenceRevisionDate = 0;
+      }
+    } else {
+      // Vision mode: require high confidence — Gemini Vision often reads creation date instead
+      if (validated.confidenceRevisionDate < 0.9) {
+        validated.extractionRules.revisionDate.validation = "failed";
+        validated.extractionRules.revisionDate.transforms.push("nulled_low_confidence_vision");
+        validated.flags.push("REVISION_DATE_LOW_CONFIDENCE_VISION");
+        validated.revisionDate = null;
+        validated.confidenceRevisionDate = 0;
+      }
+    }
+    // Both modes: null suspiciously generic dates (01/01/YYYY — creation date, not revision date)
+    if (validated.revisionDate && isSuspiciousDate(validated.revisionDate)) {
+      validated.extractionRules.revisionDate.validation = "failed";
+      validated.extractionRules.revisionDate.transforms.push("nulled_suspicious_generic_date");
+      validated.flags.push("REVISION_DATE_SUSPICIOUS");
+      validated.revisionDate = null;
+      validated.confidenceRevisionDate = 0;
+    }
+
+    // Vision mode + revision conflict: can't verify which source is correct — null date
+    if (isVisionMode && validated.revisionDate && validated.flags.includes("REVISION_CONFLICT")) {
+      validated.extractionRules.revisionDate.validation = "failed";
+      validated.extractionRules.revisionDate.transforms.push("nulled_conflict_vision");
+      validated.flags.push("REVISION_DATE_CONFLICT_VISION");
+      validated.revisionDate = null;
+      validated.confidenceRevisionDate = 0;
+    }
+  }
+
+  // ── REVISION ───────────────────────────────────────────────────────
+  if (validated.revision) {
+    if (!isVisionMode) {
+      // Text mode: revision letter/number must appear in elements
+      const revFound = valueExistsInElements(validated.revision, elements);
+      if (!revFound) {
+        validated.extractionRules.revision.validation = "failed";
+        validated.extractionRules.revision.transforms.push("nulled_no_text_evidence");
+        validated.flags.push("REVISION_NOT_IN_TEXT");
+        validated.revision = null;
+        validated.confidenceRevision = 0;
+      }
+    }
+    // Vision mode: trust the revision value (it's usually a single letter and hard to hallucinate)
+  }
+
+  // ── DRAWING NUMBER ─────────────────────────────────────────────────
+  if (validated.drawingNumber) {
+    if (!isVisionMode) {
+      const numFound = valueExistsInElements(validated.drawingNumber, elements);
+      if (!numFound) {
+        validated.extractionRules.drawingNumber.validation = "flagged";
+        validated.extractionRules.drawingNumber.transforms.push("not_found_in_text");
+        validated.flags.push("DRAWING_NUMBER_NOT_IN_TEXT");
+        // Don't null — drawing number is critical, flag for review instead
+      }
+    }
+  }
+
+  // ── DRAWING TITLE ──────────────────────────────────────────────────
+  if (validated.drawingTitle) {
+    if (!isVisionMode) {
+      // Check if at least the first significant word of the title appears
+      const words = validated.drawingTitle.split(/\s+/).filter((w) => w.length > 3);
+      const corpus = buildCorpus(elements);
+      const matchCount = words.filter((w) => corpus.includes(w.toLowerCase())).length;
+      if (words.length > 0 && matchCount === 0) {
+        validated.extractionRules.drawingTitle.validation = "flagged";
+        validated.extractionRules.drawingTitle.transforms.push("not_found_in_text");
+        validated.flags.push("DRAWING_TITLE_NOT_IN_TEXT");
+      }
+    }
+  }
+
+  // Deduplicate flags
+  validated.flags = [...new Set(validated.flags)];
 }
 
 export async function validateExtraction(
@@ -151,10 +567,17 @@ export async function validateExtraction(
   const flags: string[] = [];
 
   // Drawing number cleanup
-  const { drawingNumber, revision: cleanedRevision } = cleanDrawingNumber(
+  const { drawingNumber: rawDrawingNumber, revision: cleanedRevision, bulletStripped } = cleanDrawingNumber(
     raw.drawing_number,
     raw.revision
   );
+
+  // Sanity-check: if the drawing number looks like a title sentence, null it out
+  // and flag for review (this handles Gemini hallucinations where it confuses fields).
+  const drawingNumber = looksLikeDrawingNumber(rawDrawingNumber) ? rawDrawingNumber : null;
+  if (rawDrawingNumber && !drawingNumber) {
+    flags.push("DRAWING_NUMBER_INVALID");
+  }
 
   // Date normalisation
   const dateResult = normaliseDate(raw.revision_date);
@@ -165,6 +588,15 @@ export async function validateExtraction(
   }
   if (dateResult.confidence !== undefined) {
     dateConfidence = dateResult.confidence;
+  }
+
+  // REVISION DATE SOURCING ENFORCEMENT:
+  // If Gemini reports no revision block exists, revision_date must be null — any value
+  // returned was sourced from the title block and is prohibited by the extraction rules.
+  if (raw.revision_block_location === "none" && revisionDate !== null) {
+    flags.push("REVISION_DATE_NULLED_NO_REV_BLOCK");
+    revisionDate = null;
+    dateConfidence = 0;
   }
 
   // Revision edge cases
@@ -209,9 +641,64 @@ export async function validateExtraction(
   // Status normalisation
   const status = await normaliseStatus(raw.status);
 
+  // ── Build per-field extraction rules audit trail ──────────────────
+  // "source" is left undefined here — the extract route fills it in after
+  // it knows whether crop / region / vision mode was used.
+  const drawingNumberTransforms: string[] = [];
+  if (bulletStripped) drawingNumberTransforms.push("bullet_suffix_stripped");
+
+  const drawingTitleTransforms: string[] = [];
+  const rawTitle = raw.drawing_title;
+  if (rawTitle && /[\r\n]/.test(rawTitle)) drawingTitleTransforms.push("newlines_collapsed");
+
+  const revisionTransforms: string[] = [];
+  if (bulletStripped) revisionTransforms.push("revision_extracted_from_drawing_number");
+
+  const revisionDateTransforms: string[] = [];
+  const rawRevDate = raw.revision_date;
+  if (rawRevDate && dateResult.format && dateResult.format !== "DD/MM/YYYY") {
+    revisionDateTransforms.push("date_normalised");
+  }
+  if (flags.includes("REVISION_DATE_NULLED_NO_REV_BLOCK")) {
+    revisionDateTransforms.push("nulled_no_rev_block");
+  }
+
+  const statusTransforms: string[] = [];
+  const rawStatus = raw.status;
+  const statusNormalised = status !== rawStatus && rawStatus != null;
+  if (statusNormalised) statusTransforms.push("status_normalised");
+
+  const extractionRules: ExtractionRules = {
+    drawingNumber: {
+      transforms: drawingNumberTransforms,
+      validation: flags.includes("DRAWING_NUMBER_INVALID") ? "failed" : "passed",
+      rawValue: raw.drawing_number ?? undefined,
+    },
+    drawingTitle: {
+      transforms: drawingTitleTransforms,
+      validation: "passed",
+    },
+    revision: {
+      transforms: revisionTransforms,
+      validation: flags.includes("REVISION_CONFLICT") ? "flagged" : "passed",
+    },
+    revisionDate: {
+      transforms: revisionDateTransforms,
+      validation: flags.includes("DATE_FORMAT_UNKNOWN") ? "flagged" : "passed",
+      rawValue: rawRevDate ?? undefined,
+      normalisedFormat: dateResult.format,
+    },
+    status: {
+      transforms: statusTransforms,
+      validation: "passed",
+      rawValue: rawStatus ?? undefined,
+      canonical: statusNormalised ? (status ?? undefined) : undefined,
+    },
+  };
+
   return {
     drawingNumber,
-    drawingTitle: raw.drawing_title,
+    drawingTitle: cleanDrawingTitle(raw.drawing_title),
     revision,
     revisionDate,
     status,
@@ -222,6 +709,7 @@ export async function validateExtraction(
     confidenceRevision: raw.confidence.revision,
     confidenceRevisionDate: dateConfidence,
     confidenceStatus: raw.confidence.status,
+    confidenceLocation: raw.confidence.location ?? 0,
     conflictDetected: raw.conflict_detected ?? false,
     conflictDetail: raw.conflict_detail ?? null,
     documentType: raw.document_type ?? "unknown",
@@ -229,5 +717,6 @@ export async function validateExtraction(
     revisionBlockLocation: raw.revision_block_location ?? "unknown",
     flags: [...new Set(flags)], // deduplicate
     notes: raw.notes ?? null,
+    extractionRules,
   };
 }

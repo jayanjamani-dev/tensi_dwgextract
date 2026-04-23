@@ -1,10 +1,15 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/db";
-import { extractTextFromPdf, TextElement } from "@/lib/pdfplumber";
+import { extractTextFromRegions, extractTextFromCrop, renderPageAsImage, TextElement } from "@/lib/pdfplumber";
 import { detectCoverSheet } from "@/lib/cover-sheet";
-import { extractWithGemini } from "@/lib/gemini";
-import { validateExtraction } from "@/lib/validate-extraction";
-import { getTemplateContext, resolveArchitectAndLearnTemplate } from "@/lib/templates";
+import { extractWithGemini, extractWithGeminiVision } from "@/lib/gemini";
+import { validateExtraction, crossValidateWithElements } from "@/lib/validate-extraction";
+import {
+  getTemplateContext,
+  getTemplatePattern,
+  resolveArchitectAndLearnTemplate,
+  preResolveArchitectFromSibling,
+} from "@/lib/templates";
 import type { GeminiCallMetrics } from "@/lib/api-metrics";
 
 // Paid tier: ~1000 RPM. Free tier: 20 RPM (set GEMINI_RATE_DELAY_MS=3500).
@@ -38,6 +43,7 @@ export async function POST(
 
   for (const drawing of drawings) {
     const pipelineStart = Date.now();
+    const pipelineFlags: string[] = [];
 
     await prisma.drawing.update({
       where: { id: drawing.id },
@@ -45,13 +51,59 @@ export async function POST(
     });
 
     try {
-      // Step 1: pdfplumber
+      // ── Step 0: Template-first — pre-resolve architect before extraction ──
+      let activeArchitectId = drawing.architectId ?? null;
+      if (!activeArchitectId) {
+        const siblingArchitectId = await preResolveArchitectFromSibling(drawing.id, projectId);
+        if (siblingArchitectId) {
+          activeArchitectId = siblingArchitectId;
+          pipelineFlags.push("ARCH_PRE_RESOLVED_FROM_SIBLING");
+          await prisma.drawing.update({ where: { id: drawing.id }, data: { architectId: siblingArchitectId } });
+        }
+      }
+
+      // ── Step 1: Smart PDF extraction (region mode or template-first crop) ──
       const pdfStart = Date.now();
       let elements: TextElement[] = [];
-      const pdfResult = await extractTextFromPdf(drawing.filepath, drawing.pageNumber);
-      elements = pdfResult.elements;
-      const scanned = pdfResult.scanned;
-      const pdfError = pdfResult.error;
+      let scanned = false;
+      let pdfError: string | undefined;
+
+      // Use locked template pattern for crop mode if available
+      const PATTERN_LOCK_THRESHOLD = 2;
+      const existingPattern = await getTemplatePattern(activeArchitectId);
+      if (existingPattern && existingPattern.confirmedDrawingCount >= PATTERN_LOCK_THRESHOLD) {
+        pipelineFlags.push("TEMPLATE_FAST_PATH");
+        const cropResult = await extractTextFromCrop(drawing.filepath, drawing.pageNumber, existingPattern.bbox);
+        if (!cropResult.error && cropResult.elements.length > 0) {
+          elements = cropResult.elements;
+          scanned = cropResult.scanned;
+          pipelineFlags.push("CROP_MODE");
+        } else if (cropResult.error) {
+          // Crop extraction itself errored — fall back to region mode
+          pipelineFlags.push("CROP_ERROR_FALLBACK");
+          const regionResult = await extractTextFromRegions(drawing.filepath, drawing.pageNumber);
+          if (regionResult.error) { pdfError = regionResult.error; }
+          else { elements = regionResult.elements; scanned = regionResult.scanned; }
+        } else {
+          // Crop succeeded but returned 0 elements — PDF has no text layer in the title block area.
+          // Skip region extraction (same file would also timeout on large A0/A1 PDFs).
+          // Set scanned=true to trigger Vision fallback instead.
+          pipelineFlags.push("CROP_EMPTY_SCANNED");
+          scanned = true;
+        }
+      } else {
+        const regionResult = await extractTextFromRegions(drawing.filepath, drawing.pageNumber);
+        if (regionResult.error) {
+          pdfError = regionResult.error;
+        } else {
+          elements = regionResult.elements;
+          scanned = regionResult.scanned;
+          if (elements.length < 5 && !scanned) {
+            pipelineFlags.push("REGION_SPARSE");
+          }
+        }
+      }
+
       const pdfplumberTimeMs = Date.now() - pdfStart;
 
       if (pdfError) {
@@ -59,7 +111,7 @@ export async function POST(
           where: { id: drawing.id },
           data: {
             extractionStatus: "extracted",
-            flags: JSON.stringify(["PDF_EXTRACTION_ERROR"]),
+            flags: JSON.stringify([...pipelineFlags, "PDF_EXTRACTION_ERROR"]),
             notes: pdfError,
             pdfplumberTimeMs,
             processingTimeMs: Date.now() - pipelineStart,
@@ -69,52 +121,82 @@ export async function POST(
         continue;
       }
 
-      // Step 2: Cover sheet detection
+      // ── Step 2: Cover sheet detection ──────────────────────────────
       const isCoverSheet = detectCoverSheet(elements, drawing.filename);
-      if (isCoverSheet || scanned) {
-        const flags = [];
-        if (isCoverSheet) flags.push("COVER_SHEET");
-        if (scanned) flags.push("SCANNED");
-
+      if (isCoverSheet) {
         await prisma.drawing.update({
           where: { id: drawing.id },
           data: {
-            extractionStatus: isCoverSheet ? "cover_sheet" : "extracted",
-            documentType: isCoverSheet ? "cover_sheet" : "unknown",
+            extractionStatus: "cover_sheet",
+            documentType: "cover_sheet",
             pdfplumberRaw: JSON.stringify(elements),
-            flags: JSON.stringify(flags),
+            flags: JSON.stringify([...pipelineFlags, "COVER_SHEET"]),
             extractedAt: new Date(),
             pdfplumberTimeMs,
             processingTimeMs: Date.now() - pipelineStart,
           },
         });
-        results.push({ id: drawing.id, filename: drawing.filename, page: drawing.pageNumber, status: isCoverSheet ? "cover_sheet" : "scanned" });
+        results.push({ id: drawing.id, filename: drawing.filename, page: drawing.pageNumber, status: "cover_sheet" });
         continue;
       }
 
-      // Step 3: Rate limiting
+      // ── Step 2.5: Vision fallback for scanned PDFs ─────────────────
+      let useVision = false;
+      let visionImageBase64 = "";
+      if (scanned) {
+        pipelineFlags.push("SCANNED");
+        const imgResult = await renderPageAsImage(drawing.filepath, drawing.pageNumber);
+        if (!imgResult.error && imgResult.imageBase64) {
+          useVision = true;
+          visionImageBase64 = imgResult.imageBase64;
+          pipelineFlags.push("VISION_FALLBACK");
+        } else {
+          await prisma.drawing.update({
+            where: { id: drawing.id },
+            data: {
+              extractionStatus: "extracted",
+              documentType: "unknown",
+              pdfplumberRaw: JSON.stringify(elements),
+              flags: JSON.stringify([...pipelineFlags, "VISION_RENDER_FAILED"]),
+              notes: imgResult.error ?? "Page rendered no image",
+              extractedAt: new Date(),
+              pdfplumberTimeMs,
+              processingTimeMs: Date.now() - pipelineStart,
+            },
+          });
+          results.push({ id: drawing.id, filename: drawing.filename, page: drawing.pageNumber, status: "scanned" });
+          continue;
+        }
+      }
+
+      // ── Step 3: Rate limiting ────────────────────────────────────
       if (geminiCallCount > 0) await sleep(RATE_DELAY_MS);
       geminiCallCount++;
 
-      // Step 4: Gemini extraction
-      const templateContext = await getTemplateContext(drawing.architectId);
+      // ── Step 4: Gemini extraction ────────────────────────────────
+      const templateContext = await getTemplateContext(activeArchitectId);
       let geminiMetrics: GeminiCallMetrics | undefined;
       let geminiResult;
 
       try {
-        const response = await extractWithGemini(elements, templateContext);
+        const response = useVision
+          ? await extractWithGeminiVision(visionImageBase64, "image/png", templateContext)
+          : await extractWithGemini(elements, templateContext);
         geminiResult = response.result;
         geminiMetrics = response.metrics;
+        if (response.inputTruncated) pipelineFlags.push("INPUT_TRUNCATED");
       } catch (err) {
         const errMetrics = (err as { metrics?: GeminiCallMetrics }).metrics;
         const errMsg = err instanceof Error ? err.message : String(err);
+        const isParseError = errMsg.includes("unparseable JSON");
+        const errorFlag = isParseError ? "GEMINI_PARSE_ERROR" : "GEMINI_API_ERROR";
 
         if (errMetrics) {
           await prisma.apiCall.create({
             data: {
               drawingId: drawing.id,
               model: process.env.GEMINI_MODEL || "gemini-2.5-flash",
-              callType: "extract",
+              callType: useVision ? "extract_vision" : "extract",
               inputTokens: errMetrics.usage.inputTokens,
               outputTokens: errMetrics.usage.outputTokens,
               thinkingTokens: errMetrics.usage.thinkingTokens,
@@ -133,7 +215,7 @@ export async function POST(
           data: {
             extractionStatus: "extracted",
             pdfplumberRaw: JSON.stringify(elements),
-            flags: JSON.stringify(["GEMINI_PARSE_ERROR"]),
+            flags: JSON.stringify([...pipelineFlags, errorFlag]),
             notes: errMsg,
             extractedAt: new Date(),
             pdfplumberTimeMs,
@@ -147,11 +229,12 @@ export async function POST(
         continue;
       }
 
-      // Step 5: Validation
+      // ── Step 5: Validation ───────────────────────────────────────
       const validated = await validateExtraction(geminiResult, confidenceThreshold);
+      crossValidateWithElements(validated, elements, geminiResult);
       const processingTimeMs = Date.now() - pipelineStart;
 
-      // Step 6: Architect resolution + template learning
+      // ── Step 6: Architect resolution + template learning ─────────
       const cleanFieldPositions: Record<string, { x: number; y: number }> = {};
       if (validated.fieldCoordinates) {
         for (const [key, value] of Object.entries(validated.fieldCoordinates)) {
@@ -168,11 +251,16 @@ export async function POST(
         elements,
         projectId,
         projectName: project.name,
-        existingArchitectId: drawing.architectId,
+        existingArchitectId: activeArchitectId,
         geminiArchitectFirmName: geminiResult.architect_firm_name,
+        // Enriched metadata for template library (Task 2)
+        revision: validated.revision,
+        revisionDate: validated.revisionDate,
+        revisionDateRaw: geminiResult.revision_date,
+        status: validated.status,
       });
 
-      const allFlags = [...new Set([...validated.flags, ...templateResult.flags])];
+      const allFlags = [...new Set([...pipelineFlags, ...validated.flags, ...templateResult.flags])];
       console.log(`[extract-all] ${drawing.filename} p${drawing.pageNumber}: template=${templateResult.log.join(' | ')}`);
 
       // Persist ApiCall record
@@ -181,7 +269,7 @@ export async function POST(
           data: {
             drawingId: drawing.id,
             model: process.env.GEMINI_MODEL || "gemini-2.5-flash",
-            callType: "extract",
+            callType: useVision ? "extract_vision" : "extract",
             inputTokens: geminiMetrics.usage.inputTokens,
             outputTokens: geminiMetrics.usage.outputTokens,
             thinkingTokens: geminiMetrics.usage.thinkingTokens,
@@ -204,11 +292,13 @@ export async function POST(
           status: validated.status,
           location: validated.location,
           fieldCoordinates: validated.fieldCoordinates ? JSON.stringify(validated.fieldCoordinates) : null,
+          extractionRules: JSON.stringify(validated.extractionRules),
           confidenceDrawingNumber: validated.confidenceDrawingNumber,
           confidenceDrawingTitle: validated.confidenceDrawingTitle,
           confidenceRevision: validated.confidenceRevision,
           confidenceRevisionDate: validated.confidenceRevisionDate,
           confidenceStatus: validated.confidenceStatus,
+          confidenceLocation: validated.confidenceLocation,
           conflictDetected: validated.conflictDetected,
           conflictDetail: validated.conflictDetail,
           documentType: validated.documentType,
@@ -235,7 +325,7 @@ export async function POST(
         where: { id: drawing.id },
         data: {
           extractionStatus: "extracted",
-          flags: JSON.stringify(["EXTRACTION_ERROR"]),
+          flags: JSON.stringify([...pipelineFlags, "EXTRACTION_ERROR"]),
           notes: errMsg,
           processingTimeMs: Date.now() - pipelineStart,
         },

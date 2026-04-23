@@ -1,19 +1,18 @@
 "use client";
 
-import { useEffect, useState } from "react";
-import { 
-  Building2, 
-  Layout, 
-  BrainCircuit, 
-  ExternalLink, 
-  Save, 
-  Clock, 
+import React, { useEffect, useState } from "react";
+import {
+  Building2,
+  Layout,
+  BrainCircuit,
+  Save,
+  Clock,
   Search,
-  CheckCircle2,
   AlertCircle,
-  FileJson,
   ChevronRight,
-  Sparkles
+  Sparkles,
+  Trash2,
+  Zap,
 } from "lucide-react";
 
 interface Template {
@@ -26,6 +25,12 @@ interface Template {
   fieldLabelMap: string | null;
   valueReplacements: string | null;
   learnedRules: string | null;
+  // ── Enriched format intelligence (Task 2) ──────────────────────
+  drawingNumberFormatDesc: string | null;
+  drawingTitleConventions: string | null;
+  revisionNumberFormat: string | null;
+  revisionDateFormat: string | null;
+  statusTerminology: string | null; // JSON string[]
   lastUpdated: string;
   architect: { firmName: string; firmAddress: string | null };
 }
@@ -167,7 +172,9 @@ export default function TemplatesPage() {
                 const isEditing = editingId === t.id;
                 const edit = edits[t.id] || {};
                 const learnedRulesCount = t.learnedRules ? JSON.parse(t.learnedRules).length : 0;
-                const vocabCount = t.valueReplacements ? Object.keys(JSON.parse(t.valueReplacements)).reduce((acc, k) => acc + Object.keys(JSON.parse(t.valueReplacements)[k]).length, 0) : 0;
+                const vocabCount = t.valueReplacements ? Object.keys(JSON.parse(t.valueReplacements as string)).reduce((acc: number, k: string) => acc + Object.keys((JSON.parse(t.valueReplacements as string) as Record<string, Record<string, string>>)[k]).length, 0) : 0;
+                const hasFormatIntel = !!(t.drawingNumberFormatDesc || t.revisionNumberFormat || t.revisionDateFormat || t.statusTerminology);
+                const statusTermCount = t.statusTerminology ? (() => { try { return (JSON.parse(t.statusTerminology) as string[]).length; } catch { return 0; } })() : 0;
 
                 return (
                   <React.Fragment key={t.id}>
@@ -191,6 +198,11 @@ export default function TemplatesPage() {
                           <div className="flex items-center gap-1.5 px-2 py-1 bg-gray-100 border border-gray-200 rounded-md text-[10px] font-bold text-gray-600 uppercase">
                             <Clock className="w-3 h-3" /> Revs: {t.revisionBlockLocation || "Default"}
                           </div>
+                          {hasFormatIntel && (
+                            <div className="flex items-center gap-1.5 px-2 py-1 bg-emerald-50 border border-emerald-200 rounded-md text-[10px] font-bold text-emerald-700 uppercase">
+                              <Zap className="w-3 h-3" /> Format Intel
+                            </div>
+                          )}
                         </div>
                       </td>
                       <td className="px-6 py-6">
@@ -302,8 +314,19 @@ export default function TemplatesPage() {
                                       These are updated automatically when you correct a drawing in the viewer.
                                     </p>
                                     <div className="mt-3 flex gap-2">
-                                      <button className="text-[10px] font-bold text-fuchsia-700 bg-white border border-fuchsia-200 rounded px-2 py-1 hover:bg-fuchsia-100 transition-colors uppercase tracking-wider">
-                                        View Neural Summary
+                                      <button
+                                        onClick={async () => {
+                                          if (!confirm(`Reset all AI-learned corrections for ${t.architect.firmName}? This clears valueReplacements and learnedRules. The structural pattern (bbox) is kept.`)) return;
+                                          await fetch(`/api/templates/${t.id}`, {
+                                            method: "PATCH",
+                                            headers: { "Content-Type": "application/json" },
+                                            body: JSON.stringify({ valueReplacements: null, learnedRules: null }),
+                                          });
+                                          load();
+                                        }}
+                                        className="text-[10px] font-bold text-red-600 bg-white border border-red-200 rounded px-2 py-1 hover:bg-red-50 transition-colors uppercase tracking-wider flex items-center gap-1"
+                                      >
+                                        <Trash2 className="w-2.5 h-2.5" /> Reset Corrections
                                       </button>
                                     </div>
                                   </div>
@@ -338,6 +361,92 @@ export default function TemplatesPage() {
                               </div>
                             </div>
 
+                            {/* ── Format Intelligence Section (full width) ── */}
+                            <div className="col-span-1 md:col-span-2 border-t border-gray-100 pt-6 space-y-5">
+                              <div className="flex items-center gap-2">
+                                <Zap className="w-4 h-4 text-emerald-600" />
+                                <h4 className="text-sm font-bold text-gray-900 uppercase tracking-wider">Format Intelligence</h4>
+                                <span className="text-[10px] px-2 py-0.5 bg-emerald-100 text-emerald-700 rounded-full font-semibold ml-1">Auto-detected · editable</span>
+                              </div>
+
+                              <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4">
+                                <div className="space-y-1.5">
+                                  <label className="text-[10px] font-bold text-gray-400 uppercase tracking-wider">Drawing Number Format</label>
+                                  <input
+                                    type="text"
+                                    value={(edit.drawingNumberFormatDesc ?? t.drawingNumberFormatDesc) || ""}
+                                    onChange={(e) => setEdit(t.id, "drawingNumberFormatDesc", e.target.value || null)}
+                                    placeholder="e.g. Letter prefix + 3 digits"
+                                    className="w-full border border-gray-200 rounded-lg px-3 py-2 text-xs focus:outline-none focus:ring-2 focus:ring-emerald-500 bg-gray-50 transition-all"
+                                  />
+                                </div>
+                                <div className="space-y-1.5">
+                                  <label className="text-[10px] font-bold text-gray-400 uppercase tracking-wider">Drawing Title Conventions</label>
+                                  <input
+                                    type="text"
+                                    value={(edit.drawingTitleConventions ?? t.drawingTitleConventions) || ""}
+                                    onChange={(e) => setEdit(t.id, "drawingTitleConventions", e.target.value || null)}
+                                    placeholder="e.g. ALL-CAPS, multi-line combined"
+                                    className="w-full border border-gray-200 rounded-lg px-3 py-2 text-xs focus:outline-none focus:ring-2 focus:ring-emerald-500 bg-gray-50 transition-all"
+                                  />
+                                </div>
+                                <div className="space-y-1.5">
+                                  <label className="text-[10px] font-bold text-gray-400 uppercase tracking-wider">Revision Number Format</label>
+                                  <input
+                                    type="text"
+                                    value={(edit.revisionNumberFormat ?? t.revisionNumberFormat) || ""}
+                                    onChange={(e) => setEdit(t.id, "revisionNumberFormat", e.target.value || null)}
+                                    placeholder="e.g. Single letter (A, B, C)"
+                                    className="w-full border border-gray-200 rounded-lg px-3 py-2 text-xs focus:outline-none focus:ring-2 focus:ring-emerald-500 bg-gray-50 transition-all"
+                                  />
+                                </div>
+                                <div className="space-y-1.5">
+                                  <label className="text-[10px] font-bold text-gray-400 uppercase tracking-wider">Revision Date Format</label>
+                                  <input
+                                    type="text"
+                                    value={(edit.revisionDateFormat ?? t.revisionDateFormat) || ""}
+                                    onChange={(e) => setEdit(t.id, "revisionDateFormat", e.target.value || null)}
+                                    placeholder="e.g. DD/MM/YYYY"
+                                    className="w-full border border-gray-200 rounded-lg px-3 py-2 text-xs focus:outline-none focus:ring-2 focus:ring-emerald-500 bg-gray-50 transition-all"
+                                  />
+                                </div>
+                              </div>
+
+                              {/* Status Terminology Tags */}
+                              <div className="space-y-2">
+                                <div className="flex items-center justify-between">
+                                  <label className="text-[10px] font-bold text-gray-400 uppercase tracking-wider">
+                                    Observed Status Terminology
+                                    {statusTermCount > 0 && <span className="ml-2 text-emerald-600 font-bold">{statusTermCount} value{statusTermCount !== 1 ? "s" : ""}</span>}
+                                  </label>
+                                </div>
+                                <div className="flex flex-wrap gap-1.5 min-h-[36px] p-2 bg-gray-50 border border-gray-200 rounded-lg">
+                                  {(() => {
+                                    const statusTermValue = edit.statusTerminology ?? t.statusTerminology;
+                                    if (!statusTermValue) {
+                                      return <span className="text-[10px] text-gray-400 italic self-center">No status values observed yet — will populate automatically during extraction</span>;
+                                    }
+                                    try {
+                                      const terms = JSON.parse(statusTermValue) as string[];
+                                      if (terms.length === 0) {
+                                        return <span className="text-[10px] text-gray-400 italic self-center">No status values observed yet</span>;
+                                      }
+                                      return terms.map((term) => (
+                                        <span key={term} className="inline-flex items-center px-2.5 py-1 text-[10px] font-semibold rounded-full bg-emerald-100 text-emerald-800 border border-emerald-200 whitespace-nowrap">
+                                          {term}
+                                        </span>
+                                      ));
+                                    } catch {
+                                      return <span className="text-[10px] text-red-400 italic self-center flex items-center gap-1"><AlertCircle className="w-3 h-3" /> Invalid JSON in statusTerminology</span>;
+                                    }
+                                  })()}
+                                </div>
+                                <p className="text-[10px] text-gray-400">
+                                  Populated automatically from each successful extraction. Used to build the normalisation vocabulary for this architect.
+                                </p>
+                              </div>
+                            </div>
+
                           </div>
                         </td>
                       </tr>
@@ -353,4 +462,4 @@ export default function TemplatesPage() {
   );
 }
 
-import React from "react";
+

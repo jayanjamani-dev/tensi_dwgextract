@@ -344,6 +344,80 @@ export async function updateTemplateFromCorrection(
   void fieldName;
 }
 
+// ── Pre-Resolution: Architect lookup BEFORE extraction ─────────────
+
+/**
+ * Attempt to resolve the architect for a drawing BEFORE running extraction,
+ * by inheriting from a sibling drawing in the same project that already has one.
+ * This enables template-first extraction on the second drawing onwards.
+ */
+export async function preResolveArchitectFromSibling(
+  drawingId: string,
+  projectId: string
+): Promise<string | null> {
+  const sibling = await prisma.drawing.findFirst({
+    where: {
+      projectId,
+      architectId: { not: null },
+      id: { not: drawingId },
+    },
+    select: { architectId: true },
+  });
+  return sibling?.architectId ?? null;
+}
+
+// ── Format Inference Helpers ────────────────────────────────────────
+
+/** Infer a human-readable description of the drawing number format. */
+export function inferDrawingNumberFormatDesc(drawingNumber: string): string {
+  if (!drawingNumber || drawingNumber.length < 2) return "Unknown";
+
+  const dn = drawingNumber.trim();
+
+  // Letter + digits: A101
+  if (/^[A-Z]\d{2,4}$/.test(dn)) return `Letter prefix + ${dn.length - 1} digits (e.g. ${dn})`;
+
+  // 2-3 letters + digits: ME001, WD-401
+  if (/^[A-Z]{2,3}\d{2,4}$/.test(dn)) return `Alpha prefix + digits (e.g. ${dn})`;
+
+  // Sections with dashes: 3049-WD-A401
+  if (/^[\w]+-[\w]+-[\w]+$/.test(dn)) return `Compound sections (e.g. ${dn})`;
+
+  // Numeric only
+  if (/^\d+$/.test(dn)) return `Numeric only (e.g. ${dn})`;
+
+  // Decimal prefix: 0.A000
+  if (/^\d+\.[A-Z]\d+/.test(dn)) return `Decimal-prefixed (e.g. ${dn})`;
+
+  return `Custom format (e.g. ${dn})`;
+}
+
+/** Infer the revision number format from a value. */
+export function inferRevisionNumberFormat(revision: string | null): string | null {
+  if (!revision || revision === "-") return null;
+  if (revision === "#") return "First-issue marker (#)";
+  if (/^[A-Z]$/.test(revision)) return "Single letter (A, B, C)";
+  if (/^[A-Z]{1,2}\d+$/.test(revision)) return `Letter+number (${revision.length <= 2 ? "e.g. T1, P1" : "e.g. BP7"})`;
+  if (/^\d+$/.test(revision)) return "Numeric only (1, 2, 3)";
+  if (/^[A-Z]{1,3}\d*[A-Z]?\d*$/.test(revision)) return `Alphanumeric (${revision.substring(0, 4)}-style)`;
+  return "Custom";
+}
+
+/** Infer the revision date format from a raw (pre-normalisation) value. */
+export function inferRevisionDateFormat(rawDate: string | null): string | null {
+  if (!rawDate) return null;
+  const d = rawDate.trim();
+
+  if (/^\d{2}\/\d{2}\/\d{4}$/.test(d)) return "DD/MM/YYYY";
+  if (/^\d{2}\/\d{2}\/\d{2}$/.test(d)) return "DD/MM/YY";
+  if (/^\d{2}\.\d{2}\.\d{2,4}$/.test(d)) return "DD.MM.YY(YY)";
+  if (/^\d{2}-\d{2}-\d{2,4}$/.test(d)) return "DD-MM-YY(YY)";
+  if (/^\d{4}-\d{2}-\d{2}$/.test(d)) return "YYYY-MM-DD (ISO)";
+  if (/^\d{2}\/\d{2}$/.test(d)) return "DD/MM (no year)";
+  if (/^[A-Za-z]{3}[\s-]\d{2,4}$/.test(d)) return "Mon YY";
+  return "Custom";
+}
+
 // ── Core Auto-Learning: Architect Resolution + Template Update ──────
 
 const PATTERN_LOCK_THRESHOLD_LEARN = 2;
@@ -359,6 +433,11 @@ export interface TemplateLearningInput {
   projectName: string;
   geminiArchitectFirmName?: string | null;
   existingArchitectId: string | null;
+  // Enriched fields for template metadata (Task 2)
+  revision?: string | null;
+  revisionDate?: string | null;
+  revisionDateRaw?: string | null; // pre-normalisation date for format detection
+  status?: string | null;
 }
 
 export interface TemplateLearningResult {
@@ -466,15 +545,65 @@ export async function resolveArchitectAndLearnTemplate(
   const pageWidth = elements[0]?.page_width ?? 595;
   const pageHeight = elements[0]?.page_height ?? 842;
 
+  // Use 65% (not 75%) so the crop includes revision tables that sit above the title block.
+  // Some architects (e.g. Bates Smart) place the revision block at ~70–73% page height,
+  // which would be clipped by a 75% cutoff on first-run template learning.
   const regionBbox: TitleBlockBbox =
     side === "bottom"
-      ? { x0: 0, y0: pageHeight * 0.75, x1: pageWidth, y1: pageHeight }
+      ? { x0: 0, y0: pageHeight * 0.65, x1: pageWidth, y1: pageHeight }
       : { x0: pageWidth * 0.7, y0: 0, x1: pageWidth, y1: pageHeight };
 
   const architect = await prisma.architect.findUnique({
     where: { id: architectId },
     select: { firmName: true },
   });
+
+  // ── Enrich template with format metadata ─────────────────────
+  const enrichData: Record<string, unknown> = {};
+
+  // Drawing number format (human-readable)
+  if (input.drawingNumber) {
+    enrichData.drawingNumberFormatDesc = inferDrawingNumberFormatDesc(input.drawingNumber);
+  }
+
+  // Revision number format
+  if (input.revision) {
+    const rnf = inferRevisionNumberFormat(input.revision);
+    if (rnf) enrichData.revisionNumberFormat = rnf;
+  }
+
+  // Revision date format (from raw, pre-normalisation value)
+  if (input.revisionDateRaw) {
+    const rdf = inferRevisionDateFormat(input.revisionDateRaw);
+    if (rdf) enrichData.revisionDateFormat = rdf;
+  } else if (input.revisionDate) {
+    // Already normalised — record canonical target format
+    enrichData.revisionDateFormat = "DD/MM/YYYY";
+  }
+
+  // Status terminology — accumulate observed values
+  if (input.status) {
+    const existingTemplate = await prisma.template.findUnique({
+      where: { architectId },
+      select: { statusTerminology: true },
+    });
+    const existing: string[] = existingTemplate?.statusTerminology
+      ? JSON.parse(existingTemplate.statusTerminology)
+      : [];
+    if (!existing.includes(input.status)) {
+      existing.push(input.status);
+      enrichData.statusTerminology = JSON.stringify(existing);
+    }
+  }
+
+  // Apply enrichment if we have data
+  if (Object.keys(enrichData).length > 0) {
+    await prisma.template.upsert({
+      where: { architectId },
+      create: { architectId, ...enrichData, lastUpdated: new Date() },
+      update: { ...enrichData, lastUpdated: new Date() },
+    });
+  }
 
   if (!currentPattern) {
     const newPattern: TitleBlockPattern = {

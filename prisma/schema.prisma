@@ -47,6 +47,7 @@ model Drawing {
   status         String?
   location       String? // site / building address extracted from the drawing
   fieldCoordinates String? // JSON — {drawing_number:{x,y}, drawing_title:{x,y}, revision:{x,y}, revision_date:{x,y}, status:{x,y}, location:{x,y}}
+  extractionRules  String? // JSON — per-field rule audit trail {drawingNumber:{source,transforms,validation,...}, ...}
 
   // Confidence scores
   confidenceDrawingNumber  Float?
@@ -54,6 +55,7 @@ model Drawing {
   confidenceRevision       Float?
   confidenceRevisionDate   Float?
   confidenceStatus         Float?
+  confidenceLocation       Float?
 
   // Conflict info
   conflictDetected Boolean @default(false)
@@ -138,6 +140,13 @@ model Template {
   learnedRules          String?   // JSON array of structured rules [{ type: 'prefix', field: 'drawingNumber', ... }]
   sampleDrawingId       String?
   lastUpdated           DateTime  @default(now())
+
+  // ── Enriched template metadata (Task 2) ──────────────────────────
+  drawingNumberFormatDesc  String?  // Human-readable format: e.g. "Letter prefix + 3 digits (A101)"
+  drawingTitleConventions  String?  // Observed title conventions: e.g. "ALL-CAPS, may be multi-line"
+  revisionNumberFormat     String?  // e.g. "alphanumeric" | "letter" | "numeric" | "letter+number (T1/P1)"
+  revisionDateFormat       String?  // Observed date format: e.g. "DD/MM/YYYY" | "DD/MM/YY" | "Month YY"
+  statusTerminology        String?  // JSON array of status terms observed for this architect/firm
 }
 
 model SystemRule {

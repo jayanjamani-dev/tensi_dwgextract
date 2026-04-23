@@ -12,6 +12,24 @@ interface FieldCoordinate {
   y: number;
 }
 
+interface ExtractionFieldRule {
+  source?: string;
+  blockLocation?: string;
+  transforms: string[];
+  validation: "passed" | "failed" | "flagged";
+  rawValue?: string;
+  normalisedFormat?: string;
+  canonical?: string;
+}
+
+interface ExtractionRules {
+  drawingNumber: ExtractionFieldRule;
+  drawingTitle:  ExtractionFieldRule;
+  revision:      ExtractionFieldRule;
+  revisionDate:  ExtractionFieldRule;
+  status:        ExtractionFieldRule;
+}
+
 interface FieldCoordinates {
   drawing_number: FieldCoordinate | null;
   drawing_title:  FieldCoordinate | null;
@@ -39,6 +57,7 @@ interface Drawing {
   status:         string | null;
   location:       string | null;
   fieldCoordinates: string | null; // JSON
+  extractionRules: ExtractionRules | null;
   confidenceDrawingNumber:  number | null;
   confidenceDrawingTitle:   number | null;
   confidenceRevision:       number | null;
@@ -73,6 +92,7 @@ const FIELD_ROWS: FieldRow[] = [
   { num: 6, label: "Location",       field: "location",       coordKey: "location",       confKey: null                       },
 ];
 
+
 function ConfidenceBadge({ value }: { value: number | null }) {
   if (value === null) return <span className="text-xs text-gray-300">—</span>;
   const pct = (value * 100).toFixed(0);
@@ -87,6 +107,115 @@ function CoordCell({ coord }: { coord: FieldCoordinate | null | undefined }) {
     <span className="text-xs font-mono text-gray-500 whitespace-nowrap">
       x={Math.round(coord.x)}, y={Math.round(coord.y)}
     </span>
+  );
+}
+
+const RULE_FIELD_LABELS: Record<string, string> = {
+  drawingNumber: "Drawing No",
+  drawingTitle:  "Title",
+  revision:      "Revision",
+  revisionDate:  "Rev Date",
+  status:        "Status",
+};
+
+const SOURCE_LABELS: Record<string, string> = {
+  crop_bbox:      "Template crop",
+  region:         "Region scan",
+  vision:         "Vision OCR",
+  revision_block: "Revision block",
+  bbox_override:  "BBox override",
+};
+
+const VALIDATION_COLOURS: Record<string, string> = {
+  passed:  "text-green-600",
+  failed:  "text-red-600",
+  flagged: "text-amber-600",
+};
+
+const VALIDATION_DOT: Record<string, string> = {
+  passed:  "bg-green-500",
+  failed:  "bg-red-500",
+  flagged: "bg-amber-400",
+};
+
+function TransformPill({ label }: { label: string }) {
+  const pretty = label
+    .replace(/_/g, " ")
+    .replace(/\b\w/g, (c) => c.toUpperCase());
+  return (
+    <span className="inline-block text-xs bg-blue-50 text-blue-700 border border-blue-200 px-1.5 py-0.5 rounded font-mono">
+      {pretty}
+    </span>
+  );
+}
+
+function ExtractionRulesSection({ rules }: { rules: ExtractionRules }) {
+  const fields = ["drawingNumber", "drawingTitle", "revision", "revisionDate", "status"] as const;
+  return (
+    <div className="mx-4 mb-4 border border-gray-200 rounded-lg overflow-hidden">
+      <div className="px-3 py-2 bg-gray-50 border-b border-gray-200 flex items-center gap-2">
+        <span className="text-xs font-semibold text-gray-700 uppercase tracking-wide">Extraction Rules</span>
+        <span className="text-xs text-gray-400">How each field was derived</span>
+      </div>
+      <div className="divide-y divide-gray-100">
+        {fields.map((key) => {
+          const rule = rules[key];
+          if (!rule) return null;
+          const validationColour = VALIDATION_COLOURS[rule.validation] ?? "text-gray-600";
+          const dot = VALIDATION_DOT[rule.validation] ?? "bg-gray-400";
+          return (
+            <div key={key} className="px-3 py-2.5">
+              <div className="flex items-start justify-between gap-2">
+                <div className="flex items-center gap-1.5 min-w-[80px]">
+                  <span className={`w-1.5 h-1.5 rounded-full shrink-0 mt-0.5 ${dot}`} />
+                  <span className="text-xs font-medium text-gray-700">{RULE_FIELD_LABELS[key]}</span>
+                </div>
+                <div className="flex-1 flex flex-col gap-1 items-end">
+                  {/* Source */}
+                  {rule.source && (
+                    <div className="flex items-center gap-1">
+                      <span className="text-xs text-gray-400">Source:</span>
+                      <span className="text-xs text-gray-700 font-mono">
+                        {SOURCE_LABELS[rule.source] ?? rule.source}
+                        {rule.blockLocation && rule.blockLocation !== "unknown" && rule.blockLocation !== "none"
+                          ? ` (${rule.blockLocation})`
+                          : ""}
+                      </span>
+                    </div>
+                  )}
+                  {/* Normalised format (dates) */}
+                  {rule.normalisedFormat && rule.normalisedFormat !== "DD/MM/YYYY" && (
+                    <div className="flex items-center gap-1">
+                      <span className="text-xs text-gray-400">Format:</span>
+                      <span className="text-xs text-gray-600 font-mono">{rule.normalisedFormat} → DD/MM/YYYY</span>
+                    </div>
+                  )}
+                  {/* Status canonical mapping */}
+                  {rule.rawValue && rule.canonical && rule.rawValue !== rule.canonical && (
+                    <div className="flex items-center gap-1 flex-wrap justify-end">
+                      <span className="text-xs text-gray-400">Mapped:</span>
+                      <span className="text-xs text-gray-500 line-through font-mono">{rule.rawValue}</span>
+                      <span className="text-xs text-gray-400">→</span>
+                      <span className="text-xs text-green-700 font-mono">{rule.canonical}</span>
+                    </div>
+                  )}
+                  {/* Transforms */}
+                  {rule.transforms.length > 0 && (
+                    <div className="flex flex-wrap gap-1 justify-end">
+                      {rule.transforms.map((t) => <TransformPill key={t} label={t} />)}
+                    </div>
+                  )}
+                  {/* Validation */}
+                  <span className={`text-xs font-medium ${validationColour}`}>
+                    {rule.validation.charAt(0).toUpperCase() + rule.validation.slice(1)}
+                  </span>
+                </div>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
   );
 }
 
@@ -165,12 +294,12 @@ export default function DrawingDetailPage() {
 
   async function handleBulkApply(applyToAll: boolean) {
     if (!crossCheckResult || !drawing) return;
-    
-    // Always save the current drawing at minimum
-    const idsToApply = applyToAll && crossCheckResult.matchedDrawingIds.length > 0 
+
+    // Always include the current drawing in the apply list
+    const idsToApply = applyToAll && crossCheckResult.matchedDrawingIds.length > 0
       ? [...new Set([...crossCheckResult.matchedDrawingIds, drawing.id])]
       : [drawing.id];
-      
+
     setIsApplyingBulk(true);
     try {
       await fetch('/api/drawings/bulk-apply-region', {
@@ -181,10 +310,14 @@ export default function DrawingDetailPage() {
           fieldName: crossCheckResult.fieldName,
           applyToDrawingIds: idsToApply,
           architectId: crossCheckResult.architectId,
+          // Pass the Vision-confirmed value for the current drawing so bulk-apply
+          // doesn't need to re-extract it from pdfplumber (which may fail or be wrong).
+          knownValue: crossCheckResult.extractedValue,
+          knownDrawingId: drawing.id,
         }),
       });
       setCrossCheckResult(null);
-      load(); // Reload to show official changes
+      load(); // Reload to show updated values
     } catch {
       alert("Failed to apply changes.");
     } finally {
@@ -341,6 +474,11 @@ export default function DrawingDetailPage() {
               <span>{drawing.extractionStatus}</span>
             </div>
           </div>
+
+          {/* Extraction Rules */}
+          {drawing.extractionRules && (
+            <ExtractionRulesSection rules={drawing.extractionRules} />
+          )}
 
           {drawing.notes && (
             <div className="mx-4 mb-4 bg-gray-50 rounded-lg p-3 text-xs text-gray-600 border border-gray-200">

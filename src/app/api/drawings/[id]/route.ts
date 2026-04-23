@@ -12,7 +12,12 @@ export async function GET(
     include: { corrections: { orderBy: { correctedAt: "desc" } } },
   });
   if (!drawing) return NextResponse.json({ error: "Not found" }, { status: 404 });
-  return NextResponse.json(drawing);
+  return NextResponse.json({
+    ...drawing,
+    extractionRules: drawing.extractionRules
+      ? (() => { try { return JSON.parse(drawing.extractionRules); } catch { return null; } })()
+      : null,
+  });
 }
 
 export async function PATCH(
