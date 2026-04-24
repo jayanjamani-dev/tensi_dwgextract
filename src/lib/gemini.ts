@@ -8,6 +8,15 @@ export interface FieldCoordinate {
   y: number;
 }
 
+/** A single row from a drawing register table extracted from a cover sheet. */
+export interface DrawingRegisterEntry {
+  drawing_number: string | null;
+  drawing_title: string | null;
+  revision: string | null;
+  revision_date: string | null;
+  status: string | null;
+}
+
 export interface GeminiExtractionResult {
   drawing_number: string | null;
   drawing_title: string | null;
@@ -38,6 +47,11 @@ export interface GeminiExtractionResult {
   title_block_location: "bottom" | "bottom-right" | "right" | "left" | "unknown";
   revision_block_location: "top-left" | "left-of-title-block" | "integrated" | "none" | "unknown";
   notes: string | null;
+  /**
+   * Extracted drawing register when a drawing list table is present on the page.
+   * Always extracted in addition to the five standard fields — never replaces them.
+   */
+  drawing_register: DrawingRegisterEntry[] | null;
 }
 
 export interface GeminiExtractionResponse {
@@ -106,6 +120,79 @@ function capElements(elements: TextElement[]): {
 function isTokenLimitError(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
   return msg.includes("400") && msg.toLowerCase().includes("token");
+}
+
+/** True when the 429 error is a daily/project quota exhaustion (not retryable). */
+function isDailyQuotaExhausted(err: unknown): boolean {
+  const msg = (err instanceof Error ? err.message : String(err));
+  return msg.includes("429") && (
+    msg.includes("free_tier") ||
+    msg.includes("FreeTier") ||
+    msg.includes("PerDay") ||
+    msg.includes("per_day") ||
+    msg.includes("daily") ||
+    msg.includes("quota exceeded") ||
+    msg.toLowerCase().includes("you exceeded your current quota")
+  );
+}
+
+/** True when a Gemini error is a transient server/capacity issue worth retrying. */
+function isRetryableServerError(err: unknown): boolean {
+  // Daily quota exhaustion is permanent for the day — never retry it.
+  if (isDailyQuotaExhausted(err)) return false;
+  const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
+  return (
+    msg.includes("503") ||
+    msg.includes("502") ||
+    msg.includes("504") ||
+    msg.includes("overloaded") ||
+    msg.includes("service unavailable") ||
+    msg.includes("high demand") ||
+    msg.includes("temporarily") ||
+    msg.includes("rate limit") ||
+    msg.includes("429") ||
+    msg.includes("econnreset") ||
+    msg.includes("etimedout") ||
+    msg.includes("enotfound")
+  );
+}
+
+/** Sleep for N milliseconds. */
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Wrap a Gemini generateContent call with exponential-backoff retry for
+ * transient server errors (503 overloaded, 429 rate-limited, network blips).
+ * Non-retryable errors (400 token limits, 401/403 auth) propagate immediately.
+ *
+ * Schedule: 2s → 5s → 12s (with ±20% jitter). Max 3 retries (4 attempts total).
+ * Returns {result, serverRetries} so callers can record the retry count.
+ */
+async function generateContentWithRetry<T>(
+  fn: () => Promise<T>,
+  label: string
+): Promise<{ result: T; serverRetries: number }> {
+  const delays = [2000, 5000, 12000]; // ms
+  let lastErr: unknown;
+  for (let attempt = 0; attempt <= delays.length; attempt++) {
+    try {
+      const result = await fn();
+      return { result, serverRetries: attempt };
+    } catch (err) {
+      lastErr = err;
+      if (!isRetryableServerError(err)) throw err;
+      if (attempt === delays.length) break; // out of retries
+      const base = delays[attempt];
+      const jitter = base * (0.8 + Math.random() * 0.4); // ±20%
+      console.warn(
+        `[gemini:${label}] ${(err as Error).message?.slice(0, 100)} — retrying in ${Math.round(jitter)}ms (attempt ${attempt + 1}/${delays.length})`
+      );
+      await sleep(jitter);
+    }
+  }
+  throw lastErr;
 }
 
 const SYSTEM_PROMPT = `You are a construction drawing metadata extraction engine for an
@@ -203,18 +290,167 @@ Revision embedded in drawing title text → extract the revision value
 Status field content → NOT a revision
 
 REVISION DATE
-Extract from the most recent revision row (same row as current revision).
-Normalise to DD/MM/YYYY:
-DD/MM/YY → add century (2000s)
-DD.MM.YY → convert separators + add century
-DD-MM-YY → convert separators + add century
-YYYY-MM-DD → reorder
-Month YYYY (FEB 2026) → 01/MM/YYYY, confidence 0.7
-Mon YY (Nov 25) → 01/MM/20YY, confidence 0.7
-MMM'YY (FEB '20) → 01/MM/20YY, confidence 0.7
-Unparseable → return raw, confidence 0.5
-Do NOT use the general title block "Date" or "Date Drawn" –
-that is the drawing creation date, not the revision date.
+Follow this priority hierarchy strictly. Do not skip priorities.
+
+PART A — UNDERSTANDING THE REVISION TABLE
+
+A1. Identify the Table Header
+The revision table header row contains labels matching revision date
+terminology (Priority 2 label list below). Use terminology matching —
+do not assume a fixed row position.
+
+A2. Determine Table Orientation
+- Header at top → latest revision is the BOTTOM row
+- Header at bottom → latest revision is the TOP row
+
+A3. Identify the Latest Revision Row
+Do NOT rely on row position alone. Find the row with the HIGHEST
+revision identifier in the sequence:
+- Numeric (0, 1, 2, 3) → highest number
+- Zero-padded numeric (00, 01, 02) → highest number
+- Alpha (A, B, C, D) → latest letter
+- Mixed → use the row with the most recent date if dates are present.
+  If no dates, take the last non-empty row with a revision identifier.
+Validate using chronological date progression:
+- If dates increase logically → confirm candidate row
+- If inconsistent → select the most recent valid date from the table
+
+A4. Same-Row Rule — CRITICAL
+Revision Date must ALWAYS come from the same row as the latest
+Revision Number. Never combine values from different rows. Never
+apply proximity logic inside the revision table.
+
+PART B — PRIORITY HIERARCHY
+
+PRIORITY 1 — Revision Table
+Condition: Revision table exists AND latest row contains a valid date.
+Action:    Extract from same row as latest Revision Number.
+Confidence: 0.95-1.00
+
+If the latest row has no date (it is a raster graphic or blank) → move to Priority 2.
+
+CRITICAL RULE — Revision table present but dates are raster:
+If you can read the revision number from a revision table but CANNOT read
+the corresponding date (it is a graphic/image element with no text layer),
+DO NOT use any other date from the title block as the revision date.
+Return null for revision_date. The revision number from the table is valid;
+the date must also come from the same table — never substitute a standalone
+title block "DATE:", "DRAWN:", or similar field when the revision table's
+date column is unreadable. This prevents confusing the drawing creation date
+with the revision date.
+
+PRIORITY 2 — Title Block Revision Date Label + Proximity Search
+Condition: Revision table is confirmed absent (not just unreadable dates).
+Action:    Search title block for a revision date label. Apply
+           directional proximity search to find the date value.
+
+Step 1 — Label anchors (use highest tier first):
+  HIGH confidence labels:
+    Revision Date, Rev Date, Rev. Date, Rev Dt, Rev. Dt,
+    Date of Revision, Revision Issued Date,
+    Issue Date, Date of Issue, Issued Date, Issue Dt,
+    Amendment Date, Date of Amendment
+  MEDIUM confidence labels:
+    Issue Dte, Amended Date, Amendment Dt,
+    Change Date, Date of Change, Updated Date,
+    Last Updated, Modified Date
+  LOW confidence labels (use only if near a revision field, or if a
+  separate Drawn Date field also exists in the title block):
+    Date, Dt, Dte
+  IGNORE entirely — never treat as revision date label:
+    Approved Date, Checked Date, Designed Date, Drawn Date
+
+Step 2 — Directional proximity search (anchor = label/field center):
+  1. Horizontal right
+  2. Horizontal left
+  3. Vertical below
+  4. Vertical above
+  5. Radial search from anchor center (if directional search fails)
+
+Step 3 — Reject conflicting candidates if a date is more strongly
+associated with: Drawn Date, Checked Date, Approved Date, Plot Date,
+Printed Date, Designed Date.
+
+Step 4 — Multiple candidates: prefer shortest distance to anchor,
+strongest alignment, no conflicting nearby label.
+
+Confidence:
+  HIGH labels   → 0.85-0.95
+  MEDIUM labels → 0.60-0.80
+  LOW labels    → 0.40-0.60
+
+Special case — bare "Date" label:
+If only a bare "Date" or "Dt" field exists with no specific revision
+date label, AND a separate Drawn Date field ALSO exists in the title
+block, STILL use the bare "Date" field as revision date. The presence
+of a separate Drawn Date field increases confidence that the bare
+"Date" field is the revision date.
+
+PRIORITY 3 — Drawn Date + Proximity Search
+Condition: No revision date via Priority 1 or 2.
+Action:    Search title block for a Drawn Date label. Same proximity
+           and conflict rules as Priority 2.
+
+  HIGH confidence labels:
+    Drawn Date, Date Drawn, Drawn Dt, Drawn Dte,
+    Drn Date, Drn Dt,
+    Drawn By / Date, Drawn By & Date, Drawn / Date, Drn By / Dt
+  MEDIUM confidence labels:
+    Date of Drawing, Drawing Date, Drg Date, Drg Dt,
+    Created Date, Creation Date, Drafted Date,
+    Origination Date, Date Created, Authoring Date
+  LOW confidence labels (use only if near Drawn context):
+    Date, Dt, Dte, Draft Date, Model Creation Date, File Creation Date
+  IGNORE: Checked Date, Approved Date, Designed Date, Verified Date
+
+  Confidence: 0.60-0.75
+
+PRIORITY 4 — Plot Date + Proximity Search
+Condition: No Drawn Date via Priority 3.
+Action:    Search title block for a Plot Date label. Same proximity
+           and conflict rules.
+
+  HIGH confidence labels:
+    Plot Date, Date Plotted, Plotted Date, Plot Dt,
+    Print Date, Printed Date, Date Printed, Printed On
+  MEDIUM confidence labels:
+    Plot Dte, Print Dt, Output Date, Output Dt,
+    Generated Date, Generated On, Export Date, Exported On
+  LOW confidence labels (use only if near plot/print context):
+    Date, Dt, Dte, File Date, File Generated Date, System Date, Timestamp
+  IGNORE: Revision Date, Drawn Date, Issue Date, Checked Date
+
+  Confidence: 0.40-0.60
+
+PRIORITY 5 — Null
+Condition: Nothing found after Priorities 1-4.
+Action:    Return null. Never guess. Never hallucinate a date.
+
+PART C — DATE FORMAT NORMALISATION
+
+Normalise the returned value to DD/MM/YYYY (Australian format — day
+first). Confirmed input formats seen in Australian drawings:
+  DD.MM.YYYY   → DD/MM/YYYY (convert separators)
+  DD/MM/YYYY   → as-is
+  DD.MM.YY     → DD/MM/20YY (2000s century)
+  DD/MM/YY     → DD/MM/20YY
+  DD-MM-YY     → DD/MM/20YY
+  DD-MM-YYYY   → DD/MM/YYYY
+  MMM YYYY     → 01/MM/YYYY (e.g. JUN 2023 → 01/06/2023)
+  Mon-YY       → 01/MM/20YY (e.g. Nov-22 → 01/11/2022)
+  MON. YYYY    → 01/MM/YYYY
+  YYYY.MM.DD   → DD/MM/YYYY (only format where year comes first)
+  D/MM/YYYY    → 0D/MM/YYYY (zero-pad)
+  Sept YYYY    → 01/09/YYYY (Sept is a valid abbreviation for September)
+Unparseable → return raw with confidence 0.5.
+
+PART D — THINGS TO IGNORE (never extract as revision date)
+- Copyright years (e.g. © 2024)
+- Standard reference dates (e.g. AS 1735.1.1:2022)
+- Survey dates labelled "Date of Survey"
+- Scale references containing @A1 or @A3
+- Dates inside general notes or specifications
+- File timestamps in PDF metadata
 
 STATUS
 Check in this priority order:
@@ -273,12 +509,31 @@ File path text (C:\\Users\\...) | DIAL BEFORE YOU DIG
 "X OF Y" page counts | ECO column values (Engineering Change Order)
 DRAWING UNITS IN METRIC / IMPERIAL
 
-COVER SHEET DETECTION
-If drawing title contains: "Cover Sheet", "Drawing Index",
-"Drawing Register", "Drawing List", "Schedule of Drawings",
-"Legend of Symbols", "General Notes", or the page contains
-a table of drawing numbers and titles -> set document_type to
-"cover_sheet" and return null for all five fields.
+COVER SHEETS
+A cover sheet is a drawing whose own title block describes the index
+or register for the project. Indicators: title contains "Cover Sheet",
+"Drawing Index", "Drawing Register", "Drawing List", "Schedule of
+Drawings", "Sheet Index", "Drawing Schedule"; OR the page contains a
+structured table of drawing numbers and titles.
+
+Cover sheets are STILL DRAWINGS. They have their own title block with
+their own drawing number, drawing title, revision, revision date, and
+status. Extract all five fields from the cover sheet's own title block
+exactly as you would for any other drawing. NEVER return null for a
+field just because the document is a cover sheet — return null only if
+that specific field is genuinely absent from the cover sheet's title
+block.
+
+When a cover sheet is detected, ALSO extract the "drawing_register"
+array containing one entry per row of the drawing list table. Each
+entry includes the drawing_number, drawing_title, revision,
+revision_date, and status for that listed drawing. The column order in
+the register may vary — read the header row first to identify columns.
+If revision_date or status columns are absent from the table, set
+those fields to null within each entry.
+
+Set document_type to "cover_sheet" when detected. For non-cover-sheet
+drawings, set drawing_register to null.
 
 OUTPUT FORMAT
 Return ONLY valid JSON. No markdown, no preamble, no explanation.
@@ -304,8 +559,21 @@ Confidence: 1.0=unambiguous | 0.8=minor ambiguity |
   "document_type": "drawing | cover_sheet | specification | unknown",
   "title_block_location": "bottom | bottom-right | right | left | unknown",
   "revision_block_location": "top-left | left-of-title-block | integrated | top-of-title-block | right-of-title-block | none | empty | unknown",
-  "notes": "string | null"
+  "notes": "string | null",
+  "drawing_register": [
+    {
+      "drawing_number": "string | null",
+      "drawing_title": "string | null",
+      "revision": "string | null",
+      "revision_date": "string | null",
+      "status": "string | null"
+    }
+  ]
 }
+
+Set "drawing_register" to null for non-cover-sheet drawings.
+Set "drawing_register" to [] if a cover sheet is detected but no rows
+could be parsed from the register table.
 
 {{TEMPLATE_CONTEXT}}`;
 
@@ -347,9 +615,16 @@ export async function extractWithGemini(
   const t0 = Date.now();
 
   // If the input would still be rejected (token limit is a 400, not retryable), throw immediately.
+  // Transient 503/429/network errors are retried with exponential backoff.
   let result;
+  let serverRetries = 0;
   try {
-    result = await geminiModel.generateContent(userMessage);
+    const r = await generateContentWithRetry(
+      () => geminiModel.generateContent(userMessage),
+      "text"
+    );
+    result = r.result;
+    serverRetries = r.serverRetries;
   } catch (apiErr) {
     if (isTokenLimitError(apiErr)) {
       // Input is too large even after capping — do not retry (it will fail again).
@@ -381,15 +656,19 @@ export async function extractWithGemini(
     const costUsd = calculateCost(usage);
     return {
       result: parsed,
-      metrics: { usage, latencyMs, costUsd, retryCount, success: true },
+      metrics: { usage, latencyMs, costUsd, retryCount: retryCount + serverRetries, success: true },
       inputTruncated,
     };
   } catch {
-    // Retry once with explicit JSON formatting instruction
+    // Retry once with explicit JSON formatting instruction (also wrapped in server-error retry)
     retryCount = 1;
-    const retryResult = await geminiModel.generateContent(
-      `${userMessage}\n\nIMPORTANT: Return ONLY a valid JSON object. No markdown, no backticks, no explanation. Start your response with { and end with }`
+    const { result: retryResult, serverRetries: retryServerRetries } = await generateContentWithRetry(
+      () => geminiModel.generateContent(
+        `${userMessage}\n\nIMPORTANT: Return ONLY a valid JSON object. No markdown, no backticks, no explanation. Start your response with { and end with }`
+      ),
+      "text-json-retry"
     );
+    serverRetries += retryServerRetries;
     const retryText = retryResult.response.text().trim()
       .replace(/^```(?:json)?\s*/i, "")
       .replace(/\s*```\s*$/i, "")
@@ -412,13 +691,13 @@ export async function extractWithGemini(
       const parsed = JSON.parse(retryText) as GeminiExtractionResult;
       return {
         result: parsed,
-        metrics: { usage, latencyMs, costUsd, retryCount, success: true },
+        metrics: { usage, latencyMs, costUsd, retryCount: retryCount + serverRetries, success: true },
         inputTruncated,
       };
     } catch {
       const errorMessage = `Gemini returned unparseable JSON: ${text.slice(0, 300)}`;
       throw Object.assign(new Error(errorMessage), {
-        metrics: { usage, latencyMs, costUsd, retryCount, success: false, errorMessage },
+        metrics: { usage, latencyMs, costUsd, retryCount: retryCount + serverRetries, success: false, errorMessage },
       });
     }
   }
@@ -455,10 +734,14 @@ export async function extractWithGeminiVision(
   const t0 = Date.now();
   let retryCount = 0;
 
-  const result = await geminiModel.generateContent([
-    "Extract all required construction drawing metadata from this image. Return only valid JSON.",
-    { inlineData: { data: imageBase64, mimeType } },
-  ]);
+  const { result, serverRetries: initialServerRetries } = await generateContentWithRetry(
+    () => geminiModel.generateContent([
+      "Extract all required construction drawing metadata from this image. Return only valid JSON.",
+      { inlineData: { data: imageBase64, mimeType } },
+    ]),
+    "vision"
+  );
+  let serverRetries = initialServerRetries;
   const text = result.response.text().trim();
   const cleaned = text
     .replace(/^```(?:json)?\s*/i, "")
@@ -472,14 +755,18 @@ export async function extractWithGeminiVision(
     const costUsd = calculateCost(usage);
     return {
       result: parsed,
-      metrics: { usage, latencyMs, costUsd, retryCount, success: true },
+      metrics: { usage, latencyMs, costUsd, retryCount: retryCount + serverRetries, success: true },
     };
   } catch {
     retryCount = 1;
-    const retryResult = await geminiModel.generateContent([
-      `Extract construction drawing metadata from this image.\n\nIMPORTANT: Return ONLY a valid JSON object. No markdown, no backticks, no explanation. Start with { and end with }`,
-      { inlineData: { data: imageBase64, mimeType } },
-    ]);
+    const { result: retryResult, serverRetries: retryServerRetries } = await generateContentWithRetry(
+      () => geminiModel.generateContent([
+        `Extract construction drawing metadata from this image.\n\nIMPORTANT: Return ONLY a valid JSON object. No markdown, no backticks, no explanation. Start with { and end with }`,
+        { inlineData: { data: imageBase64, mimeType } },
+      ]),
+      "vision-json-retry"
+    );
+    serverRetries += retryServerRetries;
     const retryText = retryResult.response.text().trim()
       .replace(/^```(?:json)?\s*/i, "")
       .replace(/\s*```\s*$/i, "")
@@ -500,12 +787,12 @@ export async function extractWithGeminiVision(
       const parsed = JSON.parse(retryText) as GeminiExtractionResult;
       return {
         result: parsed,
-        metrics: { usage, latencyMs, costUsd, retryCount, success: true },
+        metrics: { usage, latencyMs, costUsd, retryCount: retryCount + serverRetries, success: true },
       };
     } catch {
       const errorMessage = `Gemini Vision returned unparseable JSON: ${text.slice(0, 300)}`;
       throw Object.assign(new Error(errorMessage), {
-        metrics: { usage, latencyMs, costUsd, retryCount, success: false, errorMessage },
+        metrics: { usage, latencyMs, costUsd, retryCount: retryCount + serverRetries, success: false, errorMessage },
       });
     }
   }

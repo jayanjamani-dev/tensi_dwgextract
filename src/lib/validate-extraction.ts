@@ -27,6 +27,7 @@ export interface ExtractionRules {
   revision:      ExtractionFieldRule;
   revisionDate:  ExtractionFieldRule;
   status:        ExtractionFieldRule;
+  [key: string]: ExtractionFieldRule;
 }
 
 export interface ValidationResult {
@@ -358,6 +359,67 @@ function valueExistsInElements(value: string | null, elements: TextElement[]): b
 }
 
 /**
+ * Returns true if the date value in elements is within close horizontal proximity
+ * of a creation-date label (DATE:, DRAWN:, etc.) — meaning it's the drawing
+ * creation date, not the revision date.
+ *
+ * Strategy: find the element(s) containing the date text, then check if any
+ * creation-date label element is within 200pt horizontally on the same row (±20pt y).
+ */
+function isMatchedToCreationDateLabel(
+  rawDate: string | null,
+  normalisedDate: string | null,
+  elements: TextElement[],
+  creationLabels: string[]
+): boolean {
+  // Find all elements that contain the date text
+  const candidates = [rawDate, normalisedDate].filter(Boolean) as string[];
+  const dateElements: TextElement[] = [];
+  for (const cand of candidates) {
+    for (const el of elements) {
+      if (el.text.trim().toLowerCase().includes(cand.toLowerCase()) ||
+          el.text.trim().replace(/\s/g, "").toLowerCase() === cand.replace(/\s/g, "").toLowerCase()) {
+        dateElements.push(el);
+      }
+    }
+  }
+  // Also try date variants (MM/DD/YY, DD/MM/YY, etc.)
+  if (dateElements.length === 0 && (rawDate || normalisedDate)) {
+    const dateStr = normalisedDate || rawDate!;
+    const parts = dateStr.match(/(\d{1,2})[/.\-](\d{1,2})[/.\-](\d{2,4})/);
+    if (parts) {
+      const [, d, m, y] = parts;
+      const year2 = y.length === 4 ? y.slice(2) : y;
+      const variants = [
+        `${d}/${m}/${y}`, `${m}/${d}/${y}`,
+        `${d}/${m}/${year2}`, `${m}/${d}/${year2}`,
+        `${d}.${m}.${y}`, `${m}.${d}.${y}`,
+      ];
+      for (const el of elements) {
+        if (variants.some(v => el.text.trim() === v)) dateElements.push(el);
+      }
+    }
+  }
+  if (dateElements.length === 0) return false;
+
+  // Check if any creation-date label is on the same row and within 200pt
+  const labelElements = elements.filter(el => {
+    const t = el.text.trim().toLowerCase();
+    return creationLabels.some(lbl => t === lbl || t.startsWith(lbl));
+  });
+  if (labelElements.length === 0) return false;
+
+  for (const dateEl of dateElements) {
+    for (const labelEl of labelElements) {
+      const sameRow = Math.abs(dateEl.y - labelEl.y) <= 20;
+      const closeHoriz = Math.abs(dateEl.x - labelEl.x) <= 200;
+      if (sameRow && closeHoriz) return true;
+    }
+  }
+  return false;
+}
+
+/**
  * Check if a date string (in various formats) appears in elements.
  * Tries multiple zero-padding variants and separator styles.
  * Example: "01/06/2023" in Gemini output should match "1/6/2023" in elements.
@@ -386,7 +448,9 @@ function dateExistsInElements(rawDate: string | null, normalisedDate: string | n
 
   const corpus = buildCorpus(elements);
 
-  // Build all plausible date variants and check each against the corpus
+  // Build all plausible date variants and check each against the corpus.
+  // Try both DD/MM/YY (AU/EU) and MM/DD/YY (US) orderings since PDFs may store
+  // the raw US format while Gemini normalises to DD/MM/YYYY.
   const separators = ["/", ".", "-"];
   const dayVariants = [dayUnpadded, dayPadded];
   const monthVariants = [monthUnpadded, monthPadded];
@@ -396,7 +460,10 @@ function dateExistsInElements(rawDate: string | null, normalisedDate: string | n
     for (const d of dayVariants) {
       for (const m of monthVariants) {
         for (const y of yearVariants) {
+          // DD/MM/YY (normalised order)
           if (corpus.includes(`${d}${sep}${m}${sep}${y}`)) return true;
+          // MM/DD/YY (US format — same numbers, swapped)
+          if (corpus.includes(`${m}${sep}${d}${sep}${y}`)) return true;
         }
       }
     }
@@ -411,6 +478,10 @@ function dateExistsInElements(rawDate: string | null, normalisedDate: string | n
     if (corpus.includes(`${dayUnpadded} ${monName} ${year4}`)) return true;
     if (corpus.includes(`${dayPadded} ${monName} ${year4}`)) return true;
   }
+
+  // Year-only fallback: PDFs sometimes store only the 4-digit year as text (day/month as graphics).
+  // If the year exists as a standalone text element, accept the date — Gemini found a real anchor.
+  if (year4 && elements.some(e => e.text.trim() === year4)) return true;
 
   return false;
 }
@@ -482,6 +553,31 @@ export function crossValidateWithElements(
         validated.flags.push("REVISION_DATE_NOT_IN_TEXT");
         validated.revisionDate = null;
         validated.confidenceRevisionDate = 0;
+      } else {
+        // Hard rule: if a revision block is confirmed present (integrated or separate) AND
+        // the date is found only adjacent to a creation-date label (DATE:, DRAWN:, SCALE:,
+        // etc.) in the main title block — not the revision table — it is the drawing
+        // creation date, NOT the revision date. Null it unconditionally.
+        // Guard: only apply when revisionBlockLocation is not "none" — if there is truly no
+        // revision block, a bare "DATE:" label may legitimately be the only date available.
+        const revBlockPresent = validated.revisionBlockLocation &&
+          validated.revisionBlockLocation !== "none" &&
+          validated.revisionBlockLocation !== "unknown";
+        if (revBlockPresent) {
+          const CREATION_DATE_LABELS = [
+            "date:", "drawn:", "drawn by:", "drawn date:", "date drawn:", "date of drawing:",
+            "scale:", "checked:", "checked by:", "designed:", "designed by:",
+            "authored:", "author:", "created:", "prepared:", "prepared by:",
+            "draftsperson:", "draughtsperson:", "draughts person:",
+          ];
+          if (isMatchedToCreationDateLabel(raw.revision_date, validated.revisionDate, elements, CREATION_DATE_LABELS)) {
+            validated.extractionRules.revisionDate.validation = "failed";
+            validated.extractionRules.revisionDate.transforms.push("nulled_creation_date_label");
+            validated.flags.push("REVISION_DATE_IS_CREATION_DATE");
+            validated.revisionDate = null;
+            validated.confidenceRevisionDate = 0;
+          }
+        }
       }
     } else {
       // Vision mode: require high confidence — Gemini Vision often reads creation date instead
@@ -590,14 +686,11 @@ export async function validateExtraction(
     dateConfidence = dateResult.confidence;
   }
 
-  // REVISION DATE SOURCING ENFORCEMENT:
-  // If Gemini reports no revision block exists, revision_date must be null — any value
-  // returned was sourced from the title block and is prohibited by the extraction rules.
-  if (raw.revision_block_location === "none" && revisionDate !== null) {
-    flags.push("REVISION_DATE_NULLED_NO_REV_BLOCK");
-    revisionDate = null;
-    dateConfidence = 0;
-  }
+  // REVISION DATE SOURCING — Priority hierarchy allows title-block fallback.
+  // v2.1+ permits Gemini to source revision_date from a revision table first,
+  // then revision-date-labelled title-block fields, then Drawn Date, then Plot Date
+  // (each with descending confidence). The prior hard null rule is removed.
+  // Downstream cross-validation still enforces textual evidence in elements.
 
   // Revision edge cases
   let revision = cleanedRevision;
@@ -658,9 +751,6 @@ export async function validateExtraction(
   const rawRevDate = raw.revision_date;
   if (rawRevDate && dateResult.format && dateResult.format !== "DD/MM/YYYY") {
     revisionDateTransforms.push("date_normalised");
-  }
-  if (flags.includes("REVISION_DATE_NULLED_NO_REV_BLOCK")) {
-    revisionDateTransforms.push("nulled_no_rev_block");
   }
 
   const statusTransforms: string[] = [];
