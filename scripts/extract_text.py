@@ -182,17 +182,22 @@ def extract_regions(pdf_path, page_index=0):
 
 
 def extract_crop(pdf_path, page_index, x0, y0, x1, y1):
-    """Extract from a fixed bounding box.
+    """Extract from a fixed bounding box plus permanent supplemental zones.
 
     Input coordinates (x0, y0, x1, y1) are in 0-based page space — i.e. origin
     at top-left with x in [0, page_width] and y in [0, page_height].  This
     matches how template bboxes are stored regardless of PDF rotation.
 
-    Supplemental bottom strip: if the crop bbox starts in the right half of the
-    page (x0 > 40% of page width), we also extract the full-width bottom 25% of
-    the page. This captures revision tables that are positioned on the left side
-    of the drawing while the title block stamp is on the right — a common layout
-    pattern where the template crop would otherwise miss the revision dates.
+    Three zones are always extracted and merged (deduplicated):
+      1. Template crop bbox  — the locked title block area
+      2. Full-width bottom 25% strip — captures left-side revision tables
+         (e.g. Wanda Terraces: revision table at x≈650, title stamp at x>1668)
+      3. Full-height right 25% strip — captures right-side title blocks and
+         revision blocks for firms like O'Neill, Cera Stribley, Ascot, MAC
+         where the title block runs the full height of the right margin
+
+    All zones are unconditional. Deduplication is always applied so text in
+    overlapping zones is never sent to Gemini twice.
 
     Returns JSON:
     {
@@ -231,31 +236,33 @@ def extract_crop(pdf_path, page_index, x0, y0, x1, y1):
         cx1 = px0 + nx1
         cy1 = py0 + ny1
 
-        cropped = page.crop((cx0, cy0, cx1, cy1))
-        words = _extract_words(cropped)
-        elements = _words_to_elements(words, pw, ph, px0=px0, py0=py0)
+        # Zone 1: template crop bbox
+        crop_words = _extract_words(page.crop((cx0, cy0, cx1, cy1)))
+        crop_elements = _words_to_elements(crop_words, pw, ph, region="crop", px0=px0, py0=py0)
 
-        # Supplemental full-width bottom strip for right-side title block layouts.
-        # Revision tables are sometimes on the left while the title block stamp
-        # (revision number/drawing number) is on the right. Without this strip the
-        # crop captures the stamp but misses the date column entirely.
-        if nx0 > pw * 0.40:
-            bottom_y0 = ph * 0.75   # bottom 25% of page
-            supp_crop = page.crop((px0, py0 + bottom_y0, px0 + pw, py0 + ph))
-            supp_words = _extract_words(supp_crop)
-            supp_elements = _words_to_elements(supp_words, pw, ph, region="bottom_supp", px0=px0, py0=py0)
-            # Deduplicate — elements in the crop bbox + bottom strip may overlap
-            seen = set()
-            merged = []
-            for el in elements + supp_elements:
-                key = (el["text"], el["x"], el["y"])
-                if key not in seen:
-                    seen.add(key)
-                    merged.append(el)
-            elements = merged
+        # Zone 2: full-width bottom 25% strip (always)
+        # Captures revision tables positioned anywhere horizontally in the lower page area.
+        bottom_y0 = ph * 0.75
+        bottom_words = _extract_words(page.crop((px0, py0 + bottom_y0, px0 + pw, py0 + ph)))
+        bottom_elements = _words_to_elements(bottom_words, pw, ph, region="bottom_supp", px0=px0, py0=py0)
+
+        # Zone 3: full-height right 25% strip (always)
+        # Captures right-margin title blocks that span the full page height.
+        right_x0 = pw * 0.75
+        right_words = _extract_words(page.crop((px0 + right_x0, py0, px0 + pw, py0 + ph)))
+        right_elements = _words_to_elements(right_words, pw, ph, region="right_supp", px0=px0, py0=py0)
+
+        # Merge all zones with deduplication — always applied
+        seen = set()
+        merged = []
+        for el in crop_elements + bottom_elements + right_elements:
+            key = (el["text"], round(el["x"], 1), round(el["y"], 1))
+            if key not in seen:
+                seen.add(key)
+                merged.append(el)
 
         result = {
-            "elements": elements,
+            "elements": merged,
             "page_width":  pw,
             "page_height": ph,
             "crop_bbox": [round(nx0, 2), round(ny0, 2), round(nx1, 2), round(ny1, 2)],
