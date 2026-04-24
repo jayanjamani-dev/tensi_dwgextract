@@ -188,6 +188,12 @@ def extract_crop(pdf_path, page_index, x0, y0, x1, y1):
     at top-left with x in [0, page_width] and y in [0, page_height].  This
     matches how template bboxes are stored regardless of PDF rotation.
 
+    Supplemental bottom strip: if the crop bbox starts in the right half of the
+    page (x0 > 40% of page width), we also extract the full-width bottom 25% of
+    the page. This captures revision tables that are positioned on the left side
+    of the drawing while the title block stamp is on the right — a common layout
+    pattern where the template crop would otherwise miss the revision dates.
+
     Returns JSON:
     {
       "elements": [...],
@@ -228,6 +234,25 @@ def extract_crop(pdf_path, page_index, x0, y0, x1, y1):
         cropped = page.crop((cx0, cy0, cx1, cy1))
         words = _extract_words(cropped)
         elements = _words_to_elements(words, pw, ph, px0=px0, py0=py0)
+
+        # Supplemental full-width bottom strip for right-side title block layouts.
+        # Revision tables are sometimes on the left while the title block stamp
+        # (revision number/drawing number) is on the right. Without this strip the
+        # crop captures the stamp but misses the date column entirely.
+        if nx0 > pw * 0.40:
+            bottom_y0 = ph * 0.75   # bottom 25% of page
+            supp_crop = page.crop((px0, py0 + bottom_y0, px0 + pw, py0 + ph))
+            supp_words = _extract_words(supp_crop)
+            supp_elements = _words_to_elements(supp_words, pw, ph, region="bottom_supp", px0=px0, py0=py0)
+            # Deduplicate — elements in the crop bbox + bottom strip may overlap
+            seen = set()
+            merged = []
+            for el in elements + supp_elements:
+                key = (el["text"], el["x"], el["y"])
+                if key not in seen:
+                    seen.add(key)
+                    merged.append(el)
+            elements = merged
 
         result = {
             "elements": elements,
