@@ -2,7 +2,7 @@
 
 **Product:** Tensi DWG Extract
 **Platform:** Next.js 16 (App Router, Turbopack) · Prisma 7 · SQLite (libsql) · Python 3 subprocess · Gemini API
-**Latest version:** v2.0 (2026-04-23)
+**Latest version:** v2.1 (2026-04-26)
 
 ---
 
@@ -110,14 +110,16 @@ The extract route (`POST /api/drawings/[id]/extract`) executes six steps in sequ
  ┌────────────────────────────────────────────────────────┐
  │ Step 0  Pre-resolve architect from sibling drawings    │
  ├────────────────────────────────────────────────────────┤
- │ Step 1  pdfplumber extraction (mode depends on state)  │
- │         • Template-hinted CROP (if pattern locked)     │
- │         • REGION scan (bottom 45% + right 45%)         │
- │         • Fallback to Vision (if 0 elements)           │
+ │ Step 1  pdfplumber three-zone extraction               │
+ │         Zone 2 — full-width bottom 25% of page         │
+ │         Zone 3 — right 25% vertical strip, full height │
+ │         Zone 4 — left 15% width, bottom 30% height     │
+ │         Cover sheets: full-page extraction             │
+ │         Deduplication by (text + x + y)                │
  ├────────────────────────────────────────────────────────┤
- │ Step 2  Cover sheet detection (skip if matched)        │
+ │ Step 2  Cover sheet detection                          │
  ├────────────────────────────────────────────────────────┤
- │ Step 2.5 Vision fallback (for scanned PDFs)            │
+ │ Step 2.5 Vision fallback (scanned PDFs — 0 elements)   │
  ├────────────────────────────────────────────────────────┤
  │ Step 3  Gemini inference                               │
  │         extractWithGemini()  OR  extractWithGeminiVision│
@@ -133,13 +135,9 @@ The extract route (`POST /api/drawings/[id]/extract`) executes six steps in sequ
  │         Evidence check: value must appear in elements  │
  │         Vision mode: stricter confidence thresholds    │
  ├────────────────────────────────────────────────────────┤
- │ Step 4.5 BBox Overrides (learned per-field bboxes)     │
- │         Applied only when Gemini confidence is low     │
- ├────────────────────────────────────────────────────────┤
- │ Step 4.6 Inject pipeline source into extractionRules   │
+ │ Step 4.5 Inject pipeline source into extractionRules   │
  ├────────────────────────────────────────────────────────┤
  │ Step 5  Architect resolution + template learning       │
- │         Pattern lock after 2 confirmed drawings        │
  ├────────────────────────────────────────────────────────┤
  │ Step 6  DB write                                       │
  └────────────────────────────────────────────────────────┘
@@ -149,23 +147,19 @@ The extract route (`POST /api/drawings/[id]/extract`) executes six steps in sequ
 
 | Mode | Trigger | pdfplumber call | Elements sent to Gemini |
 |------|---------|-----------------|-------------------------|
-| **Region** | Default / no locked pattern | `--regions` → bottom 45% + right 45% | Scoped elements, sorted by font size desc, capped at 500 |
-| **Crop (template-hinted)** | Architect has ≥ `PATTERN_LOCK_THRESHOLD` (2) confirmed drawings | `--crop x0 y0 x1 y1` with **300pt expansion** in opposite-of-title-block direction | Same capping |
+| **Three-Zone Region** | Default for all drawings | `--regions` → bottom 25% + right 25% + left-15%/bottom-30% | Deduped elements, large-font (≥14pt) sorted first, capped at 1500 |
+| **Full-Page** | Filename matches cover sheet pattern | `extract()` → full page | Same capping |
 | **Vision** | Zero text elements (scanned PDF) | `--image [dpi]` → base64 PNG | Image payload + text prompt |
-| **Crop + Vision** | Crop returns 0 elements (scanned title block area) | Render page as image | Image payload |
 
-### Important — Template as Guide, Not Boundary
+### Three-Zone Extraction
 
-The template crop bbox is treated as a **hint**, not a strict boundary. On every extraction in crop mode the bbox is expanded 300 points in the direction opposite to the title block side:
+Three zones are extracted unconditionally and deduplicated by `(text + x + y)`:
 
-- `side = "bottom"` → `y0 = max(0, tpl.y0 - 300)` (expand upward)
-- `side = "right"`  → `x0 = max(0, tpl.x0 - 300)` (expand leftward)
+- **Zone 2** — Full-width bottom 25% of page: captures the title block on bottom-strip layouts
+- **Zone 3** — Right 25% vertical strip, full page height: captures right-side vertical title blocks
+- **Zone 4** — Left 15% width, bottom 30% height: captures left-side revision tables (common on some NSW firms)
 
-**Why:** Revision blocks grow over a project's lifetime. A template learned from an early drawing with a T1 revision will have a `y0` positioned just above the T1 row. Later drawings with additional C1/C2 rows above T1 would be cut off. Expanding the bbox captures any rows added later without relearning the template. Flag: `CROP_EXPANDED`.
-
-### Region Extraction Sizing
-
-Region extraction captures **bottom 45% + right 45%** of the page (expanded from v1.x's 25%/30%). This guarantees the full title block is captured even when it extends further up or left than typical. Merged and deduplicated.
+Cover sheets detected by filename use full-page extraction so the drawing list table in the centre of the page is visible to Gemini.
 
 ---
 
@@ -200,19 +194,31 @@ Each field has a **hierarchical** extraction rule enforced in three layers: (a) 
 **Cross-validation:** at least one significant word (length > 3) must appear in elements. Otherwise flag `DRAWING_TITLE_NOT_IN_TEXT`.
 
 ### 5.3 Revision
-**Sourcing hierarchy:**
-1. **Revision block (source of truth)** — read ALL rows with dates; sort by date; current revision = most recent row's revision code. Column order varies — read headers first.
-2. **Title block fallback** — Rev, Revision, Rev No, Revision No, Issue, Issue No, Iss, Current Rev — used only if revision block is absent.
-3. **On disagreement** → revision block wins, conflict is logged in `conflict_detail`, flag `REVISION_CONFLICT`.
 
-**Special cases:**
+The revision extraction follows an 11-step master rule enforced entirely in the Gemini system prompt.
+
+**Step summary:**
+1. **STEP 0 — Input zones** — Three-zone extraction has already been applied; input is the combined deduplicated output.
+2. **STEP 1 — Detect revision table** — requires ≥1 revision identifier header + ≥1 date header in same horizontal band. **Minimum 2 data rows** — a single-row block is a title block field, not a revision table. Blank REV cells are valid data rows (counted in total, skipped in sequence analysis).
+3. **STEP 2 — Multiple tables** — if two+ tables exist, prefer the one with more data rows when dates are equal; otherwise the table with the most recent date wins. Flag: `TWO_TABLES_DETECTED`.
+4. **STEP 3 — Orientation** — header at top → latest = bottom row; header at bottom → latest = top row.
+5. **STEP 4 — Date comparison (unconditional)** — when valid dates exist, the row with the most recent date IS the latest revision row, regardless of orientation. Flag: `DATE_OVERRIDES_ORIENTATION` (replaces `ORIENTATION_DATE_CONFLICT`). When no dates exist: flag `TABLE_NO_DATES`, use orientation row.
+6. **STEP 4-FALLBACK** — fires ONLY when zero valid dates in table: match table Rev code against title block REV field.
+7. **STEP 5–6 — Row band mapping** — define ± tolerance band, map elements to columns by x-center alignment.
+8. **STEP 7 — Extract revision number** — from REV-identifier column only; never from Drawn/Checked/Approved/Description/Date columns.
+9. **STEP 8 — Table always overrides** — any value from the table row band beats the title block REV field.
+10. **STEP 9 — Field fallback** — used only if Steps 7–8 produce nothing. Flag: `FIELD_FALLBACK_USED`.
+11. **STEP 10 — Same-row lock** — revision number and revision date MUST come from the same row band.
+12. **STEP 11 — Null rule** — return null if nothing found.
+
+**Mixed sequence recognition:** `A B C … I C1 C2` is a valid ANZ construction sequence. Single alpha revisions precede stage-prefixed codes (C1 C2 < T1 T2 < BP1 BP2). Never trigger Step 4-FALLBACK for this pattern.
+
+**Special values:**
 - `"#"` → first issue, no letter yet → return `"#"`
-- `"*"`, `"-"`, blank but present → return `"-"`
-- Revision block present but empty → return `"-"`
-- Numeric revisions (`0`, `1`, `2`, `4`) are valid
-- Non-standard codes (`IA1`, `BP7`, `A0`, `amend`) are valid
+- `"*"`, `"-"`, blank → return `"-"`
 - `"@A1"` → SCALE reference, never a revision
 - Status field content → NOT a revision
+- Blank REV cell on latest row → return the date, return null for revision, flag `LATEST_ROW_HAS_BLANK_REVISION`
 
 **Cross-validation (text mode):** revision letter/number must appear in elements. If missing → null + flag `REVISION_NOT_IN_TEXT`. **Vision mode:** trusted (single letters rarely hallucinated).
 
@@ -233,16 +239,25 @@ Each field has a **hierarchical** extraction rule enforced in three layers: (a) 
 
 ### 5.5 Status
 
-**Priority order:**
-1. Large-font status stamp anywhere on page (vocabulary match, may be rotated vertically on the left margin)
-2. Dedicated field labelled: Status, Drawing Status, Issued For, Project Stage, Work Stage, Phase, Reason for Issue, Issue
-3. Description/amendment text from most recent revision row
+The status engine follows a three-priority Parts A–K rule enforced in the Gemini system prompt. Priority order: **stamp (entire page) → label (title block zones) → revision description → null**.
 
-**Normalisation:** every raw value passes through `CANONICAL_STATUS` map (§11). Unknown terms fall back to DB-stored `STATUS_NORMALISATION` rule, then passed through unchanged.
+**Part D — Priority 1: Status stamp** — large-font text anywhere on page, may be rotated (left margin watermark). Vocabulary covers ~60 terms across Restriction, Construction, Manufacture, Procurement, Approval, Building Permit, Coordination, Contract, Design/Tender, Final/Record categories.
+
+**Part E — NOT-prefix guard (critical):** before accepting any value containing CONSTRUCTION, TENDER, APPROVAL, ISSUE, or PROCUREMENT — scan all elements within **30pt vertically AND 100pt horizontally** for the word NOT. If found, the full phrase is NOT FOR [WORD] — treat as restriction. This prevents split-line "NOT FOR CONSTRUCTION" being read as "FOR CONSTRUCTION" when NOT appears at a smaller font size on a separate line.
+
+**Part F — Dual stamp logic:** when two status candidates are in close proximity (≤20pt vertical or ≤50pt horizontal), a conflict priority table determines the winner (Final/record > Construction > Manufacture > Contract > Approval/permit > Coordination > Design/tender).
+
+**Part G — Priority 2: Label in title block** — high/medium/low confidence labels; directional proximity search (right → left → below → above → radial).
+
+**Part H — Priority 3: Revision description (unconditional):** when both Priority 1 and Priority 2 return nothing AND the latest revision row is positively confirmed by BOTH revision number AND revision date — return the full description column text exactly as written, with no vocabulary match required, no truncation, no normalisation. Confidence: high (both number+date confirm), medium (only one confirms). Edge cases: empty description → `LATEST_ROW_DESCRIPTION_EMPTY`; 1–2 char description (initials) → `LATEST_ROW_DESCRIPTION_IS_INITIALS`.
+
+**Part I — Candidate comparison:** when BOTH a Priority 2 label value AND a nearby vocabulary match exist, score both against the conflict priority tier and return the higher-scoring candidate. Prevents label values (e.g. "SD" = tier 7) from silently overriding nearby stamps (e.g. "ISSUE FOR REVIEW" = tier 6).
+
+**Normalisation:** raw values pass through `CANONICAL_STATUS` map (§11). Unknown terms (from revision description fallback) are stored as-is.
 
 **Cross-validation:**
-- Text mode: at least one canonical status vocabulary phrase must appear in elements corpus. If none → null + flag `STATUS_NOT_IN_TEXT`.
-- Vision mode: requires ≥ 0.9 confidence. Below → null + `STATUS_LOW_CONFIDENCE_VISION` (Gemini Vision confidently hallucinates status frequently).
+- Text mode: at least one canonical status vocabulary phrase must appear in elements corpus. If none → null + flag `STATUS_NOT_IN_TEXT`. (Note: Priority 3 description values are not cross-validated against the vocabulary — they are already taken directly from elements.)
+- Vision mode: requires ≥ 0.9 confidence. Below → null + `STATUS_LOW_CONFIDENCE_VISION`.
 
 ### 5.6 Location (supporting)
 Site/project address when stamped on the drawing. No special validation beyond what Gemini returns.
@@ -331,11 +346,18 @@ When a template is locked for the drawing's architect, the `{{TEMPLATE_CONTEXT}}
 
 This biases Gemini toward the firm's conventions without forcing them.
 
-### Input Capping
-- Elements sorted by font size descending (labels + values are larger than body text)
-- Capped at `MAX_ELEMENTS = 500`
-- JSON payload capped at `MAX_INPUT_CHARS = 1_000_000` (~250K tokens) — 25% of Gemini 2.5 Flash's 1M token context, leaving headroom for the system prompt
-- Truncation → flag `INPUT_TRUNCATED`
+### Input Capping (`capElements()`)
+
+Elements are prepared in two-tier order before capping:
+
+1. **Large-font elements (≥14pt) sorted first unconditionally** — status stamps, title block headings, and drawing numbers are always large font. Promoting them ensures they reach Gemini regardless of their x/y position, preventing truncation of large-font stamps at the bottom of the sort.
+2. **Within each tier, sorted by bottom-right proximity** — score = `(page_height - y) + (page_width - x)` ascending (lower = closer to bottom-right corner). Keeps title block and revision table content ahead of body text.
+
+Cap: `MAX_ELEMENTS = 1500` (raised from 500 to accommodate large A0 drawings where three-zone extraction can exceed 800 elements).
+
+JSON payload secondary guard: `MAX_INPUT_CHARS = 1_000_000` (~25% of Gemini 2.5 Flash's 1M token context). If exceeded, iteratively trim to 75% until under limit.
+
+Truncation → flag `INPUT_TRUNCATED`.
 
 ---
 
@@ -377,31 +399,27 @@ This fixes a class of false negatives where Gemini returns a zero-padded date bu
 
 ---
 
-## 8. Template Learning & Pattern Locking
+## 8. Template Learning
 
 ### Goal
-Reduce per-drawing extraction cost/time after a project is underway by locking a small title-block crop and learning field positions.
-
-### Pattern Lock
-After **`PATTERN_LOCK_THRESHOLD = 2` confirmed drawings** from the same architect, the pipeline locks:
-- Title-block bounding box `{x0, y0, x1, y1}`
-- Confirmed title block side (`bottom` or `right`)
-- Drawing number format (regex)
-- Per-field `{x, y}` coordinate positions
-- Architect firm name
-
-Stored in `Template.titleBlockPattern` (JSON) and `Template.fieldPositions` (JSON).
+Associate drawings with their architect firm to enable correction learning and context injection into future Gemini calls.
 
 ### Architect Resolution
-- First drawing: architect unknown → falls through to REGION mode, Gemini identifies `architect_firm_name`, `resolveArchitectAndLearnTemplate()` creates or matches an Architect record.
-- Subsequent drawings in same project: `preResolveArchitectFromSibling()` inherits the architectId from a sibling drawing → enables template fast-path without waiting for Gemini. Flag: `ARCH_PRE_RESOLVED_FROM_SIBLING`.
-- If Gemini-returned firm name doesn't match the pre-resolved architect: conflict handled, may fall back to Unknown.
+- First drawing: architect unknown → Gemini identifies `architect_firm_name`, `resolveArchitectAndLearnTemplate()` creates or matches an Architect record.
+- Subsequent drawings in same project: `preResolveArchitectFromSibling()` inherits the architectId from an already-extracted sibling drawing → Gemini receives template context from the first call onward. Flag: `ARCH_PRE_RESOLVED_FROM_SIBLING`.
+- If Gemini-returned firm name doesn't match the pre-resolved architect: conflict handled, may fall back to `"Unknown (project X)"`. Flag: `ARCH_FALLBACK_UNKNOWN`.
+
+### Template Context Injection
+When an Architect has an associated Template record, `getTemplateContext()` formats architect-specific hints injected into the `{{TEMPLATE_CONTEXT}}` section of the system prompt:
+- Expected drawing number format
+- Known field label conventions (`fieldLabelMap`)
+- Observed revision date format
+- Known status terminology
+
+This biases Gemini toward the firm's conventions without hardcoding them.
 
 ### Value Replacements (Correction Learning)
 When a user corrects a field value via the UI, the edit is stored in `Template.valueReplacements` as `{ fieldName: { originalValue: correctedValue } }`. Future drawings with the same original value auto-apply the correction. Patterns (prefix/suffix/regex) detected via `detectPattern()` are stored in `Template.learnedRules` and matched globally across the architect.
-
-### Per-Field Learned BBoxes
-Users can manually draw a region around a field → `learnedBboxRegions` stored on the Template. On future extractions, if Gemini's confidence for that field is below threshold, the bbox is used to extract the value directly from pdfplumber text (or Vision OCR). Flag: `BBOX_OVERRIDE_<FIELDNAME>`.
 
 ---
 
@@ -590,6 +608,8 @@ id, projectId, architectId?, filename, filepath, pageNumber
 drawingNumber?, drawingTitle?, revision?, revisionDate?, status?, location?
 fieldCoordinates?     JSON — per-field {x, y}
 extractionRules?      JSON — per-field audit trail (§13)
+drawingRegister?      JSON — array of register entries from cover sheet drawing list table
+                       [{drawing_number, drawing_title, revision, revision_date, status}]
 confidenceDrawingNumber/Title/Revision/RevisionDate/Status/Location  Float?
 conflictDetected      Boolean
 conflictDetail?       String
@@ -702,22 +722,33 @@ Flags are stored in `Drawing.flags` as a JSON string array. They're the single s
 | Flag | Meaning |
 |------|---------|
 | `ARCH_PRE_RESOLVED_FROM_SIBLING` | Architect inherited from another drawing in same project |
-| `TEMPLATE_FAST_PATH` | Locked template pattern was used (≥2 confirmed drawings) |
-| `CROP_MODE` | Extraction via template bbox crop |
-| `CROP_EXPANDED` | Template bbox was expanded 300pt upward/leftward |
-| `CROP_EMPTY_SCANNED` | Crop returned 0 elements (scanned title block area) — falls through to Vision |
-| `REGION_MODE` _(implicit)_ | Default region extraction (bottom 45% + right 45%) |
-| `REGION_SPARSE` | Region scan returned < 5 elements |
-| `PATTERN_CONFIRMED` | Gemini output matches template pattern |
-| `PATTERN_MISMATCH` | Pattern validation failed — fell back to region |
-| `PATTERN_LOCKED` | Pattern newly locked (2nd confirmed drawing) |
-| `PROJECT_SIDE_LOCKED` | First 2 drawings confirmed side for project |
 | `ARCH_FALLBACK_UNKNOWN` | Architect could not be resolved, used "Unknown (project X)" |
+| `COVER_SHEET_FULL_PAGE` | Cover sheet detected by filename → full-page extraction used |
+| `COVER_SHEET` | Drawing identified as cover sheet by content detection |
+| `REGION_SPARSE` | Three-zone region scan returned < 5 elements |
 | `SCANNED` | pdfplumber returned 0 elements |
 | `VISION_FALLBACK` | Extraction used Gemini Vision instead of text |
 | `VISION_RENDER_FAILED` | Could not render page image for Vision |
 | `INPUT_TRUNCATED` | Elements array truncated before sending to Gemini |
-| `COVER_SHEET` | Drawing identified as cover sheet |
+
+### Revision Engine Flags (set by Gemini, stored in flags array)
+| Flag | Meaning |
+|------|---------|
+| `TWO_TABLES_DETECTED` | Multiple revision tables found; most-data-rows/most-recent-date table used |
+| `TABLE_NO_DATES` | Revision table exists but contains no valid dates; orientation used |
+| `DATE_OVERRIDES_ORIENTATION` | Most-recent-date row differed from orientation row; date wins |
+| `FIELD_FALLBACK_USED` | No table value found; title block REV field used |
+| `REVISION_NUMBER_COLUMN_HEADER_ABSENT` | Leftmost non-date, non-description value used |
+| `LATEST_ROW_HAS_BLANK_REVISION` | Latest row (by date) has blank REV cell; date returned, revision null |
+| `LATEST_ROW_CONFIRMED_BY_DATE_ONLY` | Latest row confirmed by date only (no revision number in row) |
+| `LATEST_ROW_CONFIRMED_BY_REVISION_NUMBER_ONLY` | Latest row confirmed by revision number only (no date) |
+
+### Status Engine Flags (set by Gemini, stored in flags array)
+| Flag | Meaning |
+|------|---------|
+| `LATEST_ROW_DESCRIPTION_EMPTY` | Priority 3 revision description fallback: description column empty |
+| `LATEST_ROW_DESCRIPTION_IS_INITIALS` | Priority 3: description is 1–2 chars (initials); skipped |
+| `SURVEY_DRAWING_NO_STATUS` | Survey drawing exception; status returned null |
 
 ### Validation Flags
 | Flag | Meaning |
@@ -729,7 +760,7 @@ Flags are stored in `Drawing.flags` as a JSON string array. They're the single s
 | `LOW_CONFIDENCE_<FIELD>` | Field confidence < threshold |
 | `NEEDS_REVIEW` | Missing required fields |
 
-### Cross-Validation Flags (v2.0+)
+### Cross-Validation Flags
 | Flag | Meaning |
 |------|---------|
 | `STATUS_NOT_IN_TEXT` | Text mode: status value has no evidence in elements; nulled |
@@ -741,11 +772,6 @@ Flags are stored in `Drawing.flags` as a JSON string array. They're the single s
 | `REVISION_NOT_IN_TEXT` | Text mode: revision letter absent from elements; nulled |
 | `DRAWING_NUMBER_NOT_IN_TEXT` | Text mode: drawing number absent; flagged only (not nulled) |
 | `DRAWING_TITLE_NOT_IN_TEXT` | Text mode: no significant title word found; flagged |
-
-### BBox Override Flags
-| Flag | Meaning |
-|------|---------|
-| `BBOX_OVERRIDE_<FIELD>` | Learned per-field bbox was applied (e.g. `BBOX_OVERRIDE_REVISION`) |
 
 ### Error Flags
 | Flag | Meaning |
@@ -760,6 +786,43 @@ Flags are stored in `Drawing.flags` as a JSON string array. They're the single s
 ## 19. Change Log
 
 All material changes to the extraction approach recorded here.
+
+---
+
+### v2.1 — 2026-04-26
+
+**Revision engine v2, status engine v2, cover sheet field extraction, drawing register, element sort overhaul**
+
+**What changed**
+
+1. **Large-font promotion in `capElements()`** — elements ≥14pt are sorted to the front of the Gemini input unconditionally (before proximity sort). Status stamps are always large font; this prevents them from being displaced past the 1500-element cap by dense body text regardless of position. `MAX_ELEMENTS` raised 500→1500 to accommodate large A0 three-zone extractions.
+
+2. **Three-zone extraction** — bottom 45%/right 45% replaced with three discrete zones: full-width bottom 25%, right 25% full height, left 15%/bottom 30%. Deduplicated by (text + x + y). Cover sheets use full-page extraction.
+
+3. **Revision master rule Steps 0–11** — complete rewrite replacing the previous 3-step hierarchy:
+   - **Minimum 2 data rows** to qualify as a revision table. Single-row Rev+Date blocks are title block fields, not revision tables.
+   - **Blank REV cell rule** — valid data row; skipped in sequence analysis but counted in total row count. If latest row has blank REV cell → return date, return null for revision, flag `LATEST_ROW_HAS_BLANK_REVISION`.
+   - **Unconditional date comparison** — when dates exist, the most-recent-date row is always the latest revision row, regardless of orientation. Replaces `ORIENTATION_DATE_CONFLICT` with `DATE_OVERRIDES_ORIENTATION`. No longer falls through to title block field matching when dates are present.
+   - **Mixed sequence recognition** — A B C…I C1 C2 is a valid ANZ construction sequence; single letters precede stage-prefixed codes. Never triggers Step 4-FALLBACK.
+   - **Step 4-FALLBACK** fires only when zero valid dates exist in the table.
+
+4. **Status engine Parts A–K** — complete rewrite replacing the previous 50-line status section:
+   - **Part E — NOT-prefix guard** — scans 30pt vertical/100pt horizontal for "NOT" before accepting any value containing CONSTRUCTION, TENDER, APPROVAL, ISSUE, or PROCUREMENT. Prevents split-line "NOT FOR CONSTRUCTION" being misread as "FOR CONSTRUCTION".
+   - **Part H — Unconditional revision description fallback** — when both Priority 1 (stamp) and Priority 2 (label) return nothing, and the latest revision row is confirmed by both number and date, the full description column text is returned exactly as written with no vocabulary match required. Eliminates dependency on a known-terms list for status captured in the revision description.
+   - **Part I — Candidate comparison** — when a Priority 2 label value and a nearby stamp both exist, both are scored against the conflict priority tier table; the higher-scoring candidate wins. Prevents lower-tier label values (e.g. "SD" = tier 7) from overriding higher-tier nearby stamps (e.g. "ISSUE FOR REVIEW" = tier 6).
+
+5. **Cover sheet field extraction** — removed the UI guard that suppressed all field values for cover sheets. Cover sheets now extract all five mandatory fields plus the `drawing_register` array from their title block, identical to any other drawing. `extractionStatus = "cover_sheet"` is set but fields are populated.
+
+6. **Drawing register** — new DB column `Drawing.drawingRegister` (JSON string). When a cover sheet is detected, Gemini extracts a structured array of all rows from the drawing list table: `[{drawing_number, drawing_title, revision, revision_date, status}]`. Surfaced in the drawing detail UI below the five main fields.
+
+7. **Template fast-path removed** — CROP mode, `TEMPLATE_FAST_PATH`, `CROP_EXPANDED`, and related flags are removed. All drawings use three-zone region extraction. Template records still exist for correction learning and context injection, but no longer control extraction crop bboxes.
+
+**Why**
+
+- A501 (24pt "FOR CONSTRUCTION" stamp): with old sort (proximity-only), the stamp ranked 1528/1724 and was cut off at the 1500 cap. Large-font promotion: rank 1 → correctly extracted as "Construction Issue" at 100% confidence.
+- 7.pdf (SD label vs ISSUE FOR REVIEW stamp): old engine chose the SD label. Candidate comparison + NOT-prefix guard → "For Review" at 90% confidence.
+- A.1093 (A/19/04/2023 vs C2/14/03/2024): blank REV cell in first row disrupted orientation; mixed C1/C2 sequence triggered wrong fallback. Three fixes → C2/14/03/2024 at 100% confidence, no conflict flags.
+- E10 Level 6 (CONTRACT ISSUE in description, no status label/stamp): old Part H required vocabulary substring match — "CONTRACT ISSUE" not in list. Unconditional description rule → "CONTRACT ISSUE" at 95% confidence.
 
 ---
 
