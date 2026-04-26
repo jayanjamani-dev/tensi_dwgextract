@@ -22,6 +22,14 @@ interface ExtractionFieldRule {
   canonical?: string;
 }
 
+interface DrawingRegisterEntry {
+  drawing_number: string | null;
+  drawing_title:  string | null;
+  revision:       string | null;
+  revision_date:  string | null;
+  status:         string | null;
+}
+
 interface ExtractionRules {
   drawingNumber: ExtractionFieldRule;
   drawingTitle:  ExtractionFieldRule;
@@ -58,6 +66,7 @@ interface Drawing {
   location:       string | null;
   fieldCoordinates: string | null; // JSON
   extractionRules: ExtractionRules | null;
+  drawingRegister: DrawingRegisterEntry[] | null;
   confidenceDrawingNumber:  number | null;
   confidenceDrawingTitle:   number | null;
   confidenceRevision:       number | null;
@@ -146,6 +155,53 @@ function TransformPill({ label }: { label: string }) {
     <span className="inline-block text-xs bg-blue-50 text-blue-700 border border-blue-200 px-1.5 py-0.5 rounded font-mono">
       {pretty}
     </span>
+  );
+}
+
+function DrawingRegisterSection({ entries }: { entries: DrawingRegisterEntry[] }) {
+  if (!entries.length) {
+    return (
+      <div className="mx-4 mb-4 border border-gray-200 rounded-lg overflow-hidden">
+        <div className="px-3 py-2 bg-purple-50 border-b border-gray-200 flex items-center gap-2">
+          <span className="text-xs font-semibold text-gray-700 uppercase tracking-wide">Drawing Register</span>
+          <span className="text-xs text-gray-400">No rows extracted</span>
+        </div>
+      </div>
+    );
+  }
+  return (
+    <div className="mx-4 mb-4 border border-gray-200 rounded-lg overflow-hidden">
+      <div className="px-3 py-2 bg-purple-50 border-b border-gray-200 flex items-center gap-2">
+        <span className="text-xs font-semibold text-gray-700 uppercase tracking-wide">Drawing Register</span>
+        <span className="text-xs text-gray-400">{entries.length} entries extracted from drawing list table</span>
+      </div>
+      <div className="max-h-96 overflow-y-auto">
+        <table className="w-full text-xs">
+          <thead className="bg-gray-50 sticky top-0">
+            <tr className="text-gray-500 uppercase tracking-wide">
+              <th className="text-left py-1.5 px-2 w-8">#</th>
+              <th className="text-left py-1.5 px-2">Drawing No</th>
+              <th className="text-left py-1.5 px-2">Title</th>
+              <th className="text-left py-1.5 px-2 w-12">Rev</th>
+              <th className="text-left py-1.5 px-2 w-20">Date</th>
+              <th className="text-left py-1.5 px-2 w-24">Status</th>
+            </tr>
+          </thead>
+          <tbody>
+            {entries.map((entry, i) => (
+              <tr key={i} className="border-t border-gray-100 hover:bg-gray-50">
+                <td className="py-1.5 px-2 text-gray-400 font-mono">{i + 1}</td>
+                <td className="py-1.5 px-2 font-mono text-gray-800">{entry.drawing_number ?? "—"}</td>
+                <td className="py-1.5 px-2 text-gray-700">{entry.drawing_title ?? "—"}</td>
+                <td className="py-1.5 px-2 font-mono text-gray-600">{entry.revision ?? "—"}</td>
+                <td className="py-1.5 px-2 font-mono text-gray-600 whitespace-nowrap">{entry.revision_date ?? "—"}</td>
+                <td className="py-1.5 px-2 text-gray-600">{entry.status ?? "—"}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
   );
 }
 
@@ -474,6 +530,11 @@ export default function DrawingDetailPage() {
               <span>{drawing.extractionStatus}</span>
             </div>
           </div>
+
+          {/* Drawing Register (cover sheets) */}
+          {drawing.drawingRegister && (
+            <DrawingRegisterSection entries={drawing.drawingRegister} />
+          )}
 
           {/* Extraction Rules */}
           {drawing.extractionRules && (

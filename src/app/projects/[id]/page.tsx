@@ -131,10 +131,6 @@ function InlineCell({
     ? "bg-amber-50 text-amber-800"
     : "";
 
-  if (isCoverSheet) {
-    return <span className="text-gray-400 italic text-xs">—</span>;
-  }
-
   if (editing) {
     return (
       <input

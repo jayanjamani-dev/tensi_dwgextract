@@ -1,12 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/db";
-import { extractTextFromRegions, extractTextFromCrop, renderPageAsImage, TextElement } from "@/lib/pdfplumber";
-import { detectCoverSheet } from "@/lib/cover-sheet";
+import { extractTextFromPdf, extractTextFromRegions, renderPageAsImage, TextElement } from "@/lib/pdfplumber";
+import { detectCoverSheet, isLikelyCoverSheetByFilename } from "@/lib/cover-sheet";
 import { extractWithGemini, extractWithGeminiVision } from "@/lib/gemini";
 import { validateExtraction, crossValidateWithElements } from "@/lib/validate-extraction";
 import {
   getTemplateContext,
-  getTemplatePattern,
   resolveArchitectAndLearnTemplate,
   preResolveArchitectFromSibling,
 } from "@/lib/templates";
@@ -51,7 +50,7 @@ export async function POST(
     });
 
     try {
-      // ── Step 0: Template-first — pre-resolve architect before extraction ──
+      // ── Step 0: Pre-resolve architect from sibling ──────────────
       let activeArchitectId = drawing.architectId ?? null;
       if (!activeArchitectId) {
         const siblingArchitectId = await preResolveArchitectFromSibling(drawing.id, projectId);
@@ -62,35 +61,21 @@ export async function POST(
         }
       }
 
-      // ── Step 1: Smart PDF extraction (region mode or template-first crop) ──
+      // ── Step 1: PDF extraction (three-zone, unconditional) ────
+      // Cover sheets use full-page extraction. All other drawings use the
+      // three-zone extractor (bottom 25% + right 25% + left-bottom 15%).
       const pdfStart = Date.now();
       let elements: TextElement[] = [];
       let scanned = false;
       let pdfError: string | undefined;
 
-      // Use locked template pattern for crop mode if available
-      const PATTERN_LOCK_THRESHOLD = 2;
-      const existingPattern = await getTemplatePattern(activeArchitectId);
-      if (existingPattern && existingPattern.confirmedDrawingCount >= PATTERN_LOCK_THRESHOLD) {
-        pipelineFlags.push("TEMPLATE_FAST_PATH");
-        const cropResult = await extractTextFromCrop(drawing.filepath, drawing.pageNumber, existingPattern.bbox);
-        if (!cropResult.error && cropResult.elements.length > 0) {
-          elements = cropResult.elements;
-          scanned = cropResult.scanned;
-          pipelineFlags.push("CROP_MODE");
-        } else if (cropResult.error) {
-          // Crop extraction itself errored — fall back to region mode
-          pipelineFlags.push("CROP_ERROR_FALLBACK");
-          const regionResult = await extractTextFromRegions(drawing.filepath, drawing.pageNumber);
-          if (regionResult.error) { pdfError = regionResult.error; }
-          else { elements = regionResult.elements; scanned = regionResult.scanned; }
-        } else {
-          // Crop succeeded but returned 0 elements — PDF has no text layer in the title block area.
-          // Skip region extraction (same file would also timeout on large A0/A1 PDFs).
-          // Set scanned=true to trigger Vision fallback instead.
-          pipelineFlags.push("CROP_EMPTY_SCANNED");
-          scanned = true;
-        }
+      const likelyCoverSheetByName = isLikelyCoverSheetByFilename(drawing.filename);
+
+      if (likelyCoverSheetByName) {
+        pipelineFlags.push("COVER_SHEET_FULL_PAGE");
+        const fullResult = await extractTextFromPdf(drawing.filepath, drawing.pageNumber);
+        if (fullResult.error) { pdfError = fullResult.error; }
+        else { elements = fullResult.elements; scanned = fullResult.scanned; }
       } else {
         const regionResult = await extractTextFromRegions(drawing.filepath, drawing.pageNumber);
         if (regionResult.error) {
@@ -121,26 +106,13 @@ export async function POST(
         continue;
       }
 
-      // ── Step 2: Cover sheet detection ──────────────────────────────
+      // ── Step 2: Cover sheet detection ────────────────────────
       const isCoverSheet = detectCoverSheet(elements, drawing.filename);
       if (isCoverSheet) {
-        await prisma.drawing.update({
-          where: { id: drawing.id },
-          data: {
-            extractionStatus: "cover_sheet",
-            documentType: "cover_sheet",
-            pdfplumberRaw: JSON.stringify(elements),
-            flags: JSON.stringify([...pipelineFlags, "COVER_SHEET"]),
-            extractedAt: new Date(),
-            pdfplumberTimeMs,
-            processingTimeMs: Date.now() - pipelineStart,
-          },
-        });
-        results.push({ id: drawing.id, filename: drawing.filename, page: drawing.pageNumber, status: "cover_sheet" });
-        continue;
+        pipelineFlags.push("COVER_SHEET");
       }
 
-      // ── Step 2.5: Vision fallback for scanned PDFs ─────────────────
+      // ── Step 2.5: Vision fallback for scanned PDFs ───────────
       let useVision = false;
       let visionImageBase64 = "";
       if (scanned) {
@@ -169,11 +141,10 @@ export async function POST(
         }
       }
 
-      // ── Step 3: Rate limiting ────────────────────────────────────
+      // ── Step 3: Rate limiting + Gemini extraction ─────────────
       if (geminiCallCount > 0) await sleep(RATE_DELAY_MS);
       geminiCallCount++;
 
-      // ── Step 4: Gemini extraction ────────────────────────────────
       const templateContext = await getTemplateContext(activeArchitectId);
       let geminiMetrics: GeminiCallMetrics | undefined;
       let geminiResult;
@@ -229,31 +200,38 @@ export async function POST(
         continue;
       }
 
-      // ── Step 5: Validation ───────────────────────────────────────
+      // ── Step 4: Validation ────────────────────────────────────
       const validated = await validateExtraction(geminiResult, confidenceThreshold);
       crossValidateWithElements(validated, elements, geminiResult);
       const processingTimeMs = Date.now() - pipelineStart;
 
-      // ── Step 6: Architect resolution + template learning ─────────
-      const cleanFieldPositions: Record<string, { x: number; y: number }> = {};
-      if (validated.fieldCoordinates) {
-        for (const [key, value] of Object.entries(validated.fieldCoordinates)) {
-          if (value) cleanFieldPositions[key] = value;
-        }
-      }
+      // ── Step 4.5: Inject pipeline source into extractionRules ─
+      const pipelineSource = useVision ? "vision" : "region";
+      const hasRevBlock =
+        validated.revisionBlockLocation !== "none" &&
+        validated.revisionBlockLocation !== "unknown" &&
+        validated.revisionBlockLocation !== null;
+      const revSource = hasRevBlock ? "revision_block" : pipelineSource;
 
+      validated.extractionRules.drawingNumber.source = pipelineSource;
+      validated.extractionRules.drawingTitle.source  = pipelineSource;
+      validated.extractionRules.revision.source      = revSource;
+      validated.extractionRules.revision.blockLocation = validated.revisionBlockLocation || undefined;
+      validated.extractionRules.revisionDate.source  = revSource;
+      validated.extractionRules.revisionDate.blockLocation = validated.revisionBlockLocation || undefined;
+      validated.extractionRules.status.source        = pipelineSource;
+
+      // ── Step 5: Architect resolution + template enrichment ────
       const templateResult = await resolveArchitectAndLearnTemplate({
         drawingId: drawing.id,
         drawingNumber: validated.drawingNumber,
         titleBlockLocation: validated.titleBlockLocation,
         revisionBlockLocation: validated.revisionBlockLocation,
-        fieldCoordinates: Object.keys(cleanFieldPositions).length > 0 ? cleanFieldPositions : null,
         elements,
         projectId,
         projectName: project.name,
         existingArchitectId: activeArchitectId,
         geminiArchitectFirmName: geminiResult.architect_firm_name,
-        // Enriched metadata for template library (Task 2)
         revision: validated.revision,
         revisionDate: validated.revisionDate,
         revisionDateRaw: geminiResult.revision_date,
@@ -293,6 +271,7 @@ export async function POST(
           location: validated.location,
           fieldCoordinates: validated.fieldCoordinates ? JSON.stringify(validated.fieldCoordinates) : null,
           extractionRules: JSON.stringify(validated.extractionRules),
+          drawingRegister: geminiResult.drawing_register ? JSON.stringify(geminiResult.drawing_register) : null,
           confidenceDrawingNumber: validated.confidenceDrawingNumber,
           confidenceDrawingTitle: validated.confidenceDrawingTitle,
           confidenceRevision: validated.confidenceRevision,
@@ -308,7 +287,10 @@ export async function POST(
           pdfplumberRaw: JSON.stringify(elements),
           flags: JSON.stringify(allFlags),
           notes: validated.notes,
-          extractionStatus: "extracted",
+          extractionStatus:
+            validated.documentType === "cover_sheet" || isCoverSheet
+              ? "cover_sheet"
+              : "extracted",
           extractedAt: new Date(),
           pdfplumberTimeMs,
           processingTimeMs,

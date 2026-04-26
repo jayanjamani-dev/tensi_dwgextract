@@ -64,11 +64,13 @@ export interface GeminiExtractionResponse {
 // ── Input sizing ───────────────────────────────────────────────────────────
 
 /**
- * Maximum elements sent to Gemini. Title blocks never need more than this —
- * excess comes from dense body text (notes, schedules) captured in the region.
- * We sort by font size descending so labels and values survive truncation.
+ * Maximum elements sent to Gemini. Elements are sorted by bottom-right
+ * proximity score (lower score = closer to bottom-right corner) so title block
+ * and revision table content always arrives within the cap regardless of font
+ * size. Cap is 1500 to accommodate large A0 drawings where the bottom zone
+ * alone can exceed 800 elements.
  */
-const MAX_ELEMENTS = 500;
+const MAX_ELEMENTS = 1500;
 
 /**
  * Maximum JSON character length for the user message (~250K tokens with 2-space
@@ -90,16 +92,38 @@ function stripInternalFields(
 }
 
 /**
- * Prepare elements for Gemini: strip internal fields, sort by font size
- * descending, cap at MAX_ELEMENTS, then guard on total JSON size.
+ * Prepare elements for Gemini: strip internal fields, sort by bottom-right
+ * proximity score, cap at MAX_ELEMENTS, then guard on total JSON size.
  * Returns the capped array and whether any truncation occurred.
+ *
+ * Sort: score = (pageHeight - y) + (pageWidth - x) ascending.
+ * Lower score = closer to bottom-right corner = title block content first.
+ * This keeps both large labels AND small 6pt revision table data cells ahead
+ * of body text regardless of font size. Right-side title blocks (vertical
+ * strip firms) also score well because their x is high (close to page_width).
  */
 function capElements(elements: TextElement[]): {
   stripped: ReturnType<typeof stripInternalFields>;
   truncated: boolean;
 } {
-  // Sort by font size descending — field labels/values are larger than body text
-  const sorted = [...elements].sort((a, b) => b.size - a.size);
+  // Large-font elements (≥14pt) are sorted to the front unconditionally —
+  // status stamps, title block headings, and drawing numbers are always
+  // large font. This prevents them from being truncated when the cap is
+  // reached, regardless of their x/y position on the page.
+  const LARGE_FONT_THRESHOLD = 14;
+  const large = elements.filter(e => e.size >= LARGE_FONT_THRESHOLD);
+  const rest  = elements.filter(e => e.size <  LARGE_FONT_THRESHOLD);
+
+  // Within each group, sort by bottom-right proximity (title block content first).
+  const proximitySort = (a: TextElement, b: TextElement) => {
+    const scoreA = (a.page_height - a.y) + (a.page_width - a.x);
+    const scoreB = (b.page_height - b.y) + (b.page_width - b.x);
+    return scoreA - scoreB;
+  };
+  large.sort(proximitySort);
+  rest.sort(proximitySort);
+
+  const sorted = [...large, ...rest];
   let truncated = sorted.length > MAX_ELEMENTS;
   let working = truncated ? sorted.slice(0, MAX_ELEMENTS) : sorted;
 
@@ -263,62 +287,175 @@ Street addresses (e.g. "280 LITTLE COLLINS ST"), client/company names
 appear in drawing_title. If the title block shows a project header above
 the drawing title, ignore it completely.
 
-REVISION
+REVISION — MASTER EXTRACTION RULE
 This is the CURRENT revision – the most recent one issued.
 
-Step 1 – Check REVISION BLOCK first (source of truth):
-- Read ALL rows with their dates
-- Sort rows by DATE to find most recent – never trust row position
-- The revision code from the most recent row by date is current
-- Column order varies – always read headers first
-- If table has REVISION + ISSUE columns, use REVISION column value
+STEP 0 — MULTI-ZONE BBOX EXTRACTION (ALWAYS UNCONDITIONAL)
+Extract text has already been extracted from all four zones before
+this prompt is called. The combined deduplicated output is the input
+you are now processing. Zones are:
+  Zone 1 — Template bbox (firm-specific stored position)
+  Zone 2 — Full-width bottom 25% of page
+  Zone 3 — Right-side vertical strip, right 25%, full height
+  Zone 4 — Left-side vertical strip (bottom 30%), left 15% width
+Deduplication has been applied by (text + x + y).
 
-Step 2 – Cross-check TITLE BLOCK:
-Labels: Rev, Revision, Rev No, Revision No, Issue, Issue No,
-Iss, Issue, Current Rev – ALL mean the same field
-If title block and revision block disagree → take revision block
-Log disagreement in conflict_detail
+STEP 1 — DETECT REVISION TABLE
+Identify column headers matching these terms:
+  Revision identifier headers: Rev, Revision, Issue, ISSUE,
+    Amendment, Amend, Amd, Version, No., R
+  Date headers: Date, Rev Date, Issue Date, Revision Date, Dt, Dte
+  Description headers: Description, Details, Amendment Description,
+    Remarks, Modification, Notes
+A revision table is confirmed when at least one revision identifier
+header AND one date header appear in the same horizontal band.
 
-Step 3 – Special cases:
-"#" → return "#" exactly (first issue, no letter assigned)
-"*", "-", blank present but empty → return "-"
-Revision block present but empty → return "-"
-Numeric revisions 0, 1, 2, 4 are valid – return as-is
-Non-standard codes IA1, IA1, BP7, A0, amend are valid – return as-is
-Revision embedded in drawing title text → extract the revision value
-"@A1" → SCALE reference – never a revision
-Status field content → NOT a revision
+A revision table requires at least 2 data rows (excluding header).
+A single-row block with a REV value and DATE is a title block
+field — not a revision table. Do not treat it as a competing table.
+
+BLANK REV CELL RULE:
+A data row with a blank or empty REV column is a valid data row.
+Do not treat it as a header. Do not discard it. Do not let it
+affect orientation detection or sequence analysis.
+When building the revision sequence for validation: skip rows with
+blank REV cells but include them in the total row count.
+If the latest row by date has a blank REV cell:
+  Return the date from that row.
+  Return null for revision number.
+  Set flag: LATEST_ROW_HAS_BLANK_REVISION.
+
+STEP 2 — IDENTIFY ALL REVISION TABLES
+If only one table → that is the active table.
+If two or more tables are present → parse the most recent date from
+each. The table with MORE data rows is preferred as the active table
+when dates are equal. Otherwise the table with the more recent date
+is the active table. Lock it. Ignore all others.
+Flag: TWO_TABLES_DETECTED
+
+STEP 3 — DETERMINE HEADER POSITION OF ACTIVE TABLE
+Locate the header row of the active table.
+  Header at top   → latest revision is the BOTTOM row
+  Header at bottom → latest revision is the TOP row
+This is the primary orientation rule — not a fallback.
+
+STEP 4 — DATE COMPARISON (UNCONDITIONAL WHEN DATES EXIST)
+When valid dates exist in the revision table, the row with the most
+recent date is ALWAYS the latest revision row. This is unconditional.
+
+  If dates exist AND most-recent-date row matches orientation row:
+    → confidence High. Proceed.
+
+  If dates exist AND most-recent-date row DIFFERS from orientation row:
+    → Use the most-recent-date row. Orientation was wrong.
+    → Do NOT flag ORIENTATION_DATE_CONFLICT.
+    → Set flag: DATE_OVERRIDES_ORIENTATION. Confidence: Medium.
+    → Do NOT fall back to title block REV matching.
+
+  ORIENTATION_DATE_CONFLICT must NOT be raised when dates are present
+  and the most recent date can be unambiguously identified.
+
+  If NO dates exist in the table:
+    → Use orientation row. Confidence: Medium. Flag: TABLE_NO_DATES.
+
+STEP 4-FALLBACK — TITLE BLOCK MATCHING (only when NO dates exist)
+This fallback fires ONLY when the revision table contains zero valid
+dates. Never fire this fallback when dates exist.
+  Match the Rev. code in the table against the title block's current
+  REV field. The row whose code exactly matches is the latest row.
+  If still no match: use the last non-empty row in the table.
+
+MIXED SEQUENCE RECOGNITION:
+The sequence A B C D E F G H I C1 C2 is a valid ANZ construction
+sequence — single alpha revisions followed by stage-prefixed codes.
+Do not flag this as an unrecognised sequence. Do not trigger
+Step 4-FALLBACK for this pattern.
+Single letters come before stage codes in ANZ practice:
+  A B C … I  <  C1 C2  <  T1 T2  <  BP1 BP2
+When a sequence mixes single alpha and stage-prefixed codes, treat
+stage-prefixed codes as later in the sequence than single letters.
+This is a pattern recognition rule, not a prefix priority rule.
+
+STEP 5 — DEFINE ROW BAND FOR LATEST ROW
+Row band = combined bbox of ALL text elements in the latest row
+± vertical tolerance.
+  tolerance = max(8pts, 0.5 × average row height)
+  Minimum floor: 8pts.
+
+STEP 6 — MAP TEXT ELEMENTS TO COLUMN HEADERS
+For each element in the row band, assign to a column by x-center
+alignment within that column's x range.
+
+REVISION NUMBER columns (extract from these only):
+  Rev, Revision, Issue, ISSUE, Amendment, Amend, Amd, Version, No., R
+
+EXCLUDED columns (never extract revision number from these):
+  Drawn By, Drawn, Drn, By, Initials, Author
+  Checked By, Checked, Chkd, Ckd
+  Approved By, Approved, App, Appd
+  Description, Details, Amendment Description, Remarks
+  Date, Rev Date, Issue Date, Revision Date, Dt, Dte
+  Sheet, Sheet No., Drawing No., DWG No.
+
+If column headers are absent: the revision number is the leftmost
+non-date, non-description value in the row band.
+Flag: REVISION_NUMBER_COLUMN_HEADER_ABSENT
+
+STEP 7 — EXTRACT REVISION NUMBER FROM ROW BAND
+Column preference: Rev > Revision > Issue > Amendment > Version > No.
+Search order within row band: LEFT of date bbox → RIGHT → full band.
+NO PATTERN VALIDATION — accept any value under a valid column header:
+  BP00, DA, IFC, Stage 3, "#", "0", "A", "IA1" — all valid.
+Confidence:
+  All three conditions met (column + row band + exclusion) → High
+  Two conditions met → Medium
+  One condition met → Low
+  Uncertain but value exists → return with Low confidence.
+  Do NOT skip to field fallback on low confidence.
+
+STEP 8 — TABLE ALWAYS OVERRIDES FIELD
+If ANY value was extracted from the table row band → use it.
+The title block REV field must NOT override the table value.
+Field fallback triggers ONLY when no value exists in the row band
+under any revision number column (and exclusion rule passes).
+
+STEP 9 — FIELD FALLBACK (only if Steps 7–8 produce nothing)
+Search title block for:
+  Rev, Revision, Revision No., Rev No., Current Revision,
+  Issue, Current Issue, Drawing Revision, Dwg Rev
+Set source = "title_block_field". Confidence = Medium (specific
+label) or Low (generic label).
+Flag: FIELD_FALLBACK_USED
+
+STEP 10 — SAME-ROW LOCK RULE (CRITICAL)
+Revision Number and Revision Date MUST come from the same row band.
+Never combine values from different rows.
+This applies regardless of which steps were used above.
+
+STEP 11 — NULL RULE
+If no value found after Steps 7–9 → return null. Never guess.
+
+Special values:
+  "#" → return "#" exactly (first issue, no letter assigned)
+  "*", "-", blank → return "-"
+  "@A1" → SCALE reference — never a revision
+  Status field content → NOT a revision
+
+Flags: ORIENTATION_DATE_CONFLICT | REVISION_NUMBER_COLUMN_HEADER_ABSENT
+       TWO_TABLES_DETECTED | TABLE_NO_DATES | FIELD_FALLBACK_USED
+       LOW_CONFIDENCE_VALUE_RETURNED
 
 REVISION DATE
 Follow this priority hierarchy strictly. Do not skip priorities.
 
 PART A — UNDERSTANDING THE REVISION TABLE
+The revision table has already been identified and the latest row
+confirmed in the REVISION steps above. The same row band applies here.
 
-A1. Identify the Table Header
-The revision table header row contains labels matching revision date
-terminology (Priority 2 label list below). Use terminology matching —
-do not assume a fixed row position.
-
-A2. Determine Table Orientation
-- Header at top → latest revision is the BOTTOM row
-- Header at bottom → latest revision is the TOP row
-
-A3. Identify the Latest Revision Row
-Do NOT rely on row position alone. Find the row with the HIGHEST
-revision identifier in the sequence:
-- Numeric (0, 1, 2, 3) → highest number
-- Zero-padded numeric (00, 01, 02) → highest number
-- Alpha (A, B, C, D) → latest letter
-- Mixed → use the row with the most recent date if dates are present.
-  If no dates, take the last non-empty row with a revision identifier.
-Validate using chronological date progression:
-- If dates increase logically → confirm candidate row
-- If inconsistent → select the most recent valid date from the table
-
-A4. Same-Row Rule — CRITICAL
-Revision Date must ALWAYS come from the same row as the latest
-Revision Number. Never combine values from different rows. Never
-apply proximity logic inside the revision table.
+A1. Same-Row Rule — CRITICAL
+Revision Date must ALWAYS come from the same row as the Revision
+Number identified in Steps 3–7 above. Never combine values from
+different rows. Never apply proximity logic inside the revision table.
 
 PART B — PRIORITY HIERARCHY
 
@@ -452,53 +589,338 @@ PART D — THINGS TO IGNORE (never extract as revision date)
 - Dates inside general notes or specifications
 - File timestamps in PDF metadata
 
-STATUS
-Check in this priority order:
+STATUS — THREE-PRIORITY EXTRACTION ENGINE
+_________________________________________
 
-1. Large font-size text anywhere on page matching status vocabulary.
-Note: status stamp may run VERTICALLY along the left margin.
+PRIORITY ORDER: Stamp (entire page) → Label/value (title block
+zones) → Revision description fallback → null.
 
-2. Dedicated field with these labels:
-Status, Drawing Status, Issued For, Project Stage, Work Stage,
-Phase, Reason for Issue, Issue, Drawing Status
+── PART A — EXTRACTION ZONES ──────────────────────────────────
 
-3. Description/amendment text from most recent revision row.
+Priority 1 stamp detection: scan the ENTIRE page.
+Priority 2 label detection: title block zones only:
+  Zone 1 — full-width bottom 25% of page
+  Zone 2 — right 25% vertical strip, full height
+  Zone 3 — left 15% width, bottom 30% height
 
-Known status vocabulary (normalise to canonical values):
-Preliminary: Preliminary, Preliminary Issue, Sketch Design,
-Pre-Tender Issue, Draft, Preliminary D&C
-Tender Issue: Tender, Tender Issue, For Tender, T,
-Tender D&C, Tender Documentation, Revised Tender Issue,
-Tenderable
-Construction Issue: Construction Issue, Issued for Construction,
-For Construction, Construction, Construction D&C, CD Issue
-Preliminary Construction Issue: Preliminary Construction Issue
-For Pricing: For Pricing
-Not for Construction: Not for Construction, NOT FOR CONSTRUCTION
-For Building Approval: Building Approval, For Building Approval
-For Building Permit: Building Permit Issue, BP Issue, For Building Permit
-For CDC Approval: CDC, CDC Approval, For CDC Approval, CDC Issue
-(these three are LEGALLY DISTINCT — never merge them)
-For Review: For Review, Issue for Review, Issue for MCC Review
-For Information Only: For Information Only,
-For Information Only Not for Construction
-For Coordination: For Coordination, Coordination Issue
-For Approval: For Approval, Approval
-Design Development: Design Development
-Working Drawing: Working Drawing
-As Built: As Built, AS BUILT
-As Installed: As Installed, AS INSTALLED
-Issued for Tender: Issued for Tender, ISSUED FOR TENDER
+── PART B — SEPARATOR DETECTION (apply before all other rules) ─
 
-IGNORE - never use as status values:
-"THIS IS NOT AN INSTALLATION DOCUMENT"
-"TO BE PRINTED IN COLOUR" / "DOCUMENTED IN COLOR"
-"DO NOT SCALE" / "DO NOT SCALE DRAWING"
-Copyright text / © / "MUST NOT BE COPIED"
-Scale references containing "@A"
-Plot dates and timestamps
-"DIAL BEFORE YOU DIG"
-Discipline labels: CIVIL DRAWING, STRUCTURAL DRAWING
+Scan detected status text for separators: /  &  AND  +
+If present: split on separator, trim each part, treat each as a
+separate status, apply dual stamp logic (Part F) to the pair.
+Example: "APPROVAL / CONSTRUCTION" → split → dual stamp logic.
+If no separator: treat as single value, continue below.
+
+── PART C — ABBREVIATION EXPANSION ─────────────────────────────
+
+Expand BEFORE matching vocabulary:
+  IFC → ISSUED FOR CONSTRUCTION
+  IFA → ISSUED FOR APPROVAL
+  IFT → ISSUED FOR TENDER
+  IFI → ISSUED FOR INFORMATION
+  IFR → ISSUED FOR REVIEW
+  NFC → NOT FOR CONSTRUCTION
+  DD  → DESIGN DEVELOPMENT
+  SD  → SCHEMATIC DESIGN
+  WIP → WORK IN PROGRESS
+
+── PART D — PRIORITY 1: STANDALONE STATUS STAMP ────────────────
+
+A stamp is: large font relative to surroundings, bold, boxed or
+bordered, centred/prominent, uppercase, and/or anywhere on page.
+
+ROTATED STAMP: text at rotation outside 0°±5° and 90°±5° →
+  treat as watermark, accept regardless of position.
+
+MULTI-LINE STAMP: two elements within 5pt vertically whose
+  individual texts don't match but combined text does → detect
+  each line separately, proceed to dual stamp logic (Part F).
+  Do NOT concatenate multi-line stamp text into one string.
+
+LABEL VS STAMP: if large bold status value appears immediately
+  below a status label → treat as Priority 2 (title block field),
+  not Priority 1 stamp.
+
+STAMP VOCABULARY — accept any of the following:
+
+Restriction / Negative (Absolute — always override):
+  DO NOT USE | FOR REFERENCE ONLY | VOID | SUPERSEDED
+  CANCELLED | HOLD
+
+Restriction / Negative (Non-absolute):
+  NOT FOR CONSTRUCTION | NOT FOR ISSUE | NOT FOR TENDER
+  NOT FOR APPROVAL | NOT FOR PROCUREMENT | DO NOT CONSTRUCT
+
+Construction / Execution:
+  FOR CONSTRUCTION | ISSUED FOR CONSTRUCTION | IFC
+  APPROVED FOR CONSTRUCTION | CONSTRUCTION ISSUE
+  ISSUED FOR CONSTRUCTION | CD ISSUE
+
+Manufacture / Fabrication / Workshop:
+  FOR MANUFACTURE | ISSUED FOR MANUFACTURE | FOR FABRICATION
+  ISSUED FOR FABRICATION | APPROVED FOR FABRICATION
+  APPROVED FOR MANUFACTURE | FOR PRODUCTION
+  RELEASED FOR PRODUCTION | SHOP DRAWING | FOR SHOP DRAWING
+  FOR SHOP USE | FOR WORKSHOP | WORKSHOP ISSUE
+  FOR INSTALLATION | INSTALLATION DRAWING
+
+Procurement:
+  FOR PROCUREMENT | ISSUED FOR PROCUREMENT
+  RELEASED FOR PROCUREMENT | FOR ORDERING | FOR PURCHASE
+
+Approval / Review / Information:
+  FOR APPROVAL | ISSUED FOR APPROVAL | APPROVED
+  CONDITIONALLY APPROVED | CERTIFIED | AUTHORIZED | REGISTERED
+  FOR REVIEW | ISSUED FOR REVIEW | FOR INFORMATION
+  ISSUED FOR INFORMATION | IFI | IFR | FOR MCC REVIEW
+
+Building Permit / Planning:
+  FOR BUILDING PERMIT | BUILDING PERMIT ISSUE
+  FOR BUILDING PERMIT [any integer — pattern: FOR BUILDING PERMIT \d+]
+  FOR CDC APPROVAL | FOR PLANNING PERMIT | PLANNING PERMIT ISSUE
+  TOWN PLANNING ISSUE | FOR COUNCIL APPROVAL
+  ISSUED FOR COUNCIL APPROVAL
+
+Coordination / Review:
+  FOR COORDINATION | ISSUE FOR COORDINATION
+  ISSUED FOR COORDINATION | FOR ARCHITECTURAL REVIEW
+  WIP FOR ARCHITECTURAL REVIEW | ARCHITECT'S REVIEW
+  FOR ENGINEER REVIEW | FOR CLIENT REVIEW | CLIENT REVIEW
+  FOR STRUCTURAL REVIEW | FOR HYDRAULIC REVIEW
+  FOR SERVICES REVIEW
+
+Contract / Pre-construction:
+  CONTRACT ISSUE | CONTRACT DRAFT ISSUE | CONTRACT SET ISSUE
+  FOR CONTRACT | ISSUED FOR CONTRACT
+
+Design / Tender:
+  SKETCH | CONCEPT | PRELIMINARY | DRAFT | SCHEMATIC DESIGN
+  DESIGN DEVELOPMENT | TENDER | FOR TENDER | TENDER ONLY
+  IFT | DD | SD | WIP | PRELIMINARY ISSUE | PRELIMINARY D&C
+  PRE-TENDER ISSUE | TENDER DOCUMENTATION | TENDER D&C
+  REVISED TENDER ISSUE | TENDERABLE
+
+Final / Record:
+  AS BUILT | AS-BUILT | AS CONSTRUCTED | AS INSTALLED
+  AS FITTED | RECORD DRAWING | RECORD DRAWINGS | RECORD SET
+  FINAL RECORD | FINAL AS BUILT | APPROVED AS BUILT
+  CERTIFIED AS BUILT | VERIFIED AS BUILT
+  PRELIMINARY AS BUILT | DRAFT AS BUILT | FOR RECORD
+  ISSUED FOR RECORD
+
+Pricing / Information:
+  FOR PRICING | FOR INFORMATION ONLY
+  FOR INFORMATION ONLY NOT FOR CONSTRUCTION
+
+Working Drawing:
+  WORKING DRAWING
+
+IGNORE AS STATUS (never extract):
+  TO BE PRINTED IN COLOUR | DO NOT SCALE | DIAL BEFORE YOU DIG
+  THIS IS NOT AN INSTALLATION DOCUMENT
+  Copyright notices / © / MUST NOT BE COPIED
+  Scale references containing @A1 or @A3
+  Discipline labels: CIVIL DRAWING, STRUCTURAL DRAWING,
+    ELECTRICAL SERVICES
+  DRAWN BY / CHECKED BY / APPROVED BY labels
+  Plot dates and timestamps
+
+── PART E — NOT-PREFIX GUARD (apply before all other rules) ────
+
+CRITICAL: Before extracting any status value containing the word
+CONSTRUCTION, TENDER, APPROVAL, ISSUE, or PROCUREMENT — scan
+ALL text elements within 30pt vertically AND 100pt horizontally
+of that element for the word NOT.
+
+If NOT is found within that proximity zone:
+  The full phrase is NOT FOR [WORD] — treat it as a restriction.
+  Never extract the partial phrase FOR CONSTRUCTION, FOR TENDER,
+  etc. when NOT is present nearby.
+
+This prevents misreading split-line or small-font NOT FOR
+CONSTRUCTION as FOR CONSTRUCTION when the word NOT appears on
+a different line or at a smaller font size.
+
+Example:
+  Element 1: 'NOT' at y=570, x=605, size=2.7
+  Element 2: 'FOR CONSTRUCTION' at y=577, x=605, size=5.3
+  → Within 30pt vertically → full phrase = NOT FOR CONSTRUCTION
+  → Treat as non-absolute restriction, NOT as construction status
+
+── PART E2 — RESTRICTION STATUS LOGIC ──────────────────────────
+
+ABSOLUTE RESTRICTIONS (override everything):
+  DO NOT USE | FOR REFERENCE ONLY | VOID | SUPERSEDED
+  CANCELLED | HOLD
+
+NON-ABSOLUTE RESTRICTIONS (do not override co-located status):
+  NOT FOR CONSTRUCTION | NOT FOR ISSUE | NOT FOR TENDER
+  NOT FOR APPROVAL | NOT FOR PROCUREMENT | DO NOT CONSTRUCT
+
+Fix 1 — restriction + secondary status (far proximity):
+  Non-absolute restriction + another status → return other status
+  Absolute restriction + another status → return absolute restriction
+
+Fix 2 — two-line stacked stamp (same visual box):
+  One line = non-restriction, other line = non-absolute restriction
+  → return the non-restriction status. Never concatenate.
+  Example: FOR APPROVAL / NOT FOR CONSTRUCTION → FOR APPROVAL
+
+Fix 3 — restriction appearing alone (no other status found):
+  → return the restriction status as final output
+
+Fix 4 — DESIGN DEVELOPMENT + NOT FOR CONSTRUCTION:
+  NOT FOR CONSTRUCTION is non-absolute → return DESIGN DEVELOPMENT
+
+── PART F — DUAL STAMP LOGIC (close proximity) ─────────────────
+
+Proximity threshold: vertical ≤ 20pt OR horizontal ≤ 50pt.
+
+Case 1 — non-absolute restriction + non-restriction:
+  Return the non-restriction status.
+Case 2 — absolute restriction + non-restriction:
+  Return the absolute restriction status.
+Case 3 — both non-restriction:
+  Apply conflict priority (highest wins):
+    1. Final/record  2. Construction  3. Manufacture/fabrication
+    4. Contract      5. Approval/permit  6. Coordination/review
+    7. Design/tender
+Case 4 — both absolute restrictions:
+  Priority: VOID > SUPERSEDED > CANCELLED > DO NOT USE >
+            HOLD > FOR REFERENCE ONLY
+
+── PART G — PRIORITY 2: STATUS LABEL IN TITLE BLOCK ────────────
+
+If no stamp found, search title block zones for a label.
+
+High confidence labels:
+  Drawing Status | Document Status | Issue Status
+  Revision Status | Drawing Issue | Issue | Issued For
+  Project Stage | Work Stage | Reason for Issue
+
+Medium confidence labels:
+  Stage | Status Code | Issue Type | Document Stage
+  Drawing Stage | Phase | Issue Code | Doc Status
+  Rev Status | Issue Ref
+
+Low confidence labels (strong context only):
+  Type | Category | Level | Class
+
+Ignore as labels: Drawn | Checked | Approved | Revision |
+  Date | Scale
+
+Once label found, extract nearest value via directional
+proximity: right → left → below → above → radial.
+Value must match vocabulary from Part D (apply Part C expansion).
+
+── PART H — PRIORITY 3: REVISION DESCRIPTION → STATUS (UNCONDITIONAL)
+
+When Priority 1 (stamp) and Priority 2 (label) both return nothing,
+apply this rule.
+
+WHEN THIS RULE APPLIES — all four conditions must be true:
+  1. A revision table has been detected
+  2. The latest revision row has been positively identified using
+     BOTH revision number AND revision date
+  3. Both values come from the same row (Same-Row Lock)
+  4. The description column of that row contains text
+
+WHAT TO EXTRACT:
+  Return the full text from the description column of the confirmed
+  latest revision row EXACTLY as written. Do not modify, normalise,
+  truncate, or check against the vocabulary list.
+  Do not reject any text because it is not a known status term.
+  Do not require a vocabulary match or substring match.
+
+Valid outputs under this rule (not exhaustive):
+  DEFECT ISSUE | CONTRACT ISSUE | PRELIMINARY ISSUE
+  CONSTRUCTION ISSUE | ISSUED FOR TENDER | RAISED BASEMENT AMENDED
+  REVISED AS PER ARCHITECT COMMENTS | FOR COORDINATION — STRUCTURAL UPDATE
+  ANY OTHER FREE TEXT IN THE DESCRIPTION COLUMN
+
+Description column headers: Description | Revision Description |
+  Nature of Revision | Amendment Details | Reason for Change |
+  Change | Details | Remarks | Comments | Reason | Issue
+
+CONFIDENCE:
+  Both revision number AND revision date confirm latest row → High
+  Only one of revision number or revision date confirms → Medium
+
+SOURCE: revision_table_description
+
+EDGE CASES:
+  Description column empty → skip, return null, flag: LATEST_ROW_DESCRIPTION_EMPTY
+  Description is 1–2 characters only (e.g. "SH", "JG" — initials) →
+    skip, return null, flag: LATEST_ROW_DESCRIPTION_IS_INITIALS
+  Latest row confirmed by date only (rev number blank) →
+    apply rule, confidence: medium, flag: LATEST_ROW_CONFIRMED_BY_DATE_ONLY
+  Latest row confirmed by revision number only (no date in row) →
+    apply rule, confidence: medium, flag: LATEST_ROW_CONFIRMED_BY_REVISION_NUMBER_ONLY
+  Vision mode (scanned PDF) → same logic applies, no difference
+
+DO NOT:
+  Check description against vocabulary | Normalise to canonical value
+  Reject because term is unknown | Truncate to extract a known phrase
+  Apply abbreviation expansion | Flag as low confidence for unknown terms
+
+── PART I — CANDIDATE COMPARISON RULE ──────────────────────────
+
+Applies when BOTH of the following are found:
+  Candidate A — a value from a Priority 2 status label/field
+  Candidate B — a status vocabulary term in close proximity
+                to the label or anywhere else on the page
+
+Do NOT automatically prefer A over B because it came from a label.
+Instead:
+
+Step 1 — Apply abbreviation expansion (Part C) to BOTH candidates.
+
+Step 2 — Score each candidate against the vocabulary hierarchy
+  from the conflict priority table in Part F:
+    1. Final/record status      (highest)
+    2. Construction/execution
+    3. Manufacture/fabrication
+    4. Contract/pre-construction
+    5. Approval/permit
+    6. Coordination/review
+    7. Design/tender             (lowest)
+  An abbreviated or single-letter value (SD, DD, T, etc.) that
+  expands to a vocabulary term scores at that term's tier.
+  A candidate that does not appear in the vocabulary at all
+  scores below tier 7.
+
+Step 3 — Return the candidate with the HIGHER tier score.
+  If both are the same tier — return Candidate A (label value).
+
+Example from drawing 7.pdf:
+  Candidate A (STATUS label): "SD" → expands → Schematic Design
+    → tier 7 (Design/tender)
+  Candidate B (nearby stamp): "ISSUE FOR REVIEW"
+    → tier 6 (Coordination/review)
+  Tier 6 > tier 7 → return "Issue for Review"
+
+Note: if Candidate B is a non-absolute restriction (NOT FOR
+CONSTRUCTION etc.) and Candidate A is a non-restriction status,
+apply Part E Fix 1 — return Candidate A regardless of tier.
+
+── PART J — SURVEY DRAWING EXCEPTION ───────────────────────────
+
+If no drawing number, VERSION field instead of REV, and Date of
+Survey field present → return null for status, flag:
+SURVEY_DRAWING_NO_STATUS.
+
+── PART J — STATUS OUTPUT ───────────────────────────────────────
+
+Return the extracted status as the "status" string in the JSON.
+If dual stamp or secondary status detected, include both values
+in the notes field. Use the flags array for SURVEY_DRAWING_NO_STATUS
+or other status warnings. Set confidence.status accordingly:
+  Stamp, prominent: 0.90-1.00
+  Stamp, via abbreviation expansion: 0.75-0.85
+  Label high confidence: 0.85-0.95
+  Label medium confidence: 0.60-0.80
+  Revision description fallback: 0.40-0.65
+  Nothing found: null
 
 NOISE - NEVER USE AS FIELD VALUES
 @A1, @A0, @A3, @A2, @A4 | REMIT VERSION + year

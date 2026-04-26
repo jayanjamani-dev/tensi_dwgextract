@@ -17,6 +17,9 @@ export async function GET(
     extractionRules: drawing.extractionRules
       ? (() => { try { return JSON.parse(drawing.extractionRules); } catch { return null; } })()
       : null,
+    drawingRegister: drawing.drawingRegister
+      ? (() => { try { return JSON.parse(drawing.drawingRegister); } catch { return null; } })()
+      : null,
   });
 }
 

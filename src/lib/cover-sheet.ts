@@ -18,6 +18,29 @@ const COVER_SHEET_NUMBER_PATTERNS = /^(0\.A000|A0{3,4}|M0{3,4}|A000|M000)$/i;
 // Patterns suggesting a drawing list table (column headers for a register)
 const REGISTER_COLUMN_PATTERNS = ["drawing number", "sheet number", "sheet name", "sheet title", "drawing title", "drg no", "dwg no"];
 
+/**
+ * Fast pre-extraction heuristic based on filename only.
+ * Use this to decide whether to route to full-page extraction (so Gemini can
+ * see the drawing list table in the middle of the page, not just the title
+ * block crop).
+ */
+export function isLikelyCoverSheetByFilename(filename?: string): boolean {
+  if (!filename) return false;
+  const fn = filename.toLowerCase();
+  return (
+    fn.includes("cover") ||
+    fn.includes("index") ||
+    fn.includes("register") ||
+    fn.includes("drawing-list") ||
+    fn.includes("drawing_list") ||
+    fn.includes("drawing list") ||
+    fn.includes("sheet-list") ||
+    fn.includes("sheet_list") ||
+    fn.includes("schedule") ||
+    /\b(a000|a0000|m000|m0000|c000)\b/.test(fn)
+  );
+}
+
 export function detectCoverSheet(
   elements: TextElement[],
   filename?: string

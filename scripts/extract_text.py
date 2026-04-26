@@ -97,7 +97,19 @@ def extract(pdf_path, page_index=0):
 
 
 def extract_regions(pdf_path, page_index=0):
-    """Extract from bottom strip (bottom 25%) + right column (right 30%) only.
+    """Universal three-zone extraction — runs unconditionally on every drawing.
+
+    Zone 2: Full-width bottom 25% of page (captures all horizontal-strip title
+            blocks and left/right-positioned revision tables)
+    Zone 3: Right-side vertical strip, right 25% full height (captures right-
+            margin title blocks spanning the full page height)
+    Zone 4: Left-side vertical strip, bottom 30% only, left 15% width (captures
+            GKA-style three-column revision tables in the left margin without
+            pulling in body content higher up the page)
+
+    All three zones extracted independently, combined, deduplicated by
+    (text + x + y). The title_block_side heuristic is retained for
+    informational purposes only — it no longer gates extraction.
 
     Returns JSON:
     {
@@ -128,21 +140,22 @@ def extract_regions(pdf_path, page_index=0):
         ph = float(page.height)
         px0, py0 = _page_origin(page)  # internal page origin
 
-        # Convert 0-based fractions to internal page coordinates for cropping
-        # Bottom strip: bottom 45% of page, full width
-        # Expanded from 25% to 45% to ensure full revision block + title block captured
-        # regardless of architect-specific layout variations.
-        bottom_norm_y0 = ph * 0.55                            # 0-based
-        bottom_bbox_internal = (px0,             py0 + bottom_norm_y0,
-                                px0 + pw,        py0 + ph)
+        # Zone 2: Full-width bottom 25%
+        # Covers all horizontal-strip title blocks and revision tables regardless
+        # of left/right position. 25% is sufficient for A0/A1 sheets; the zone
+        # starts at y=0.75*ph.
+        bottom_norm_y0 = ph * 0.75                            # 0-based
+        bottom_bbox_internal = (px0,      py0 + bottom_norm_y0,
+                                px0 + pw, py0 + ph)
         bottom_crop = page.crop(bottom_bbox_internal)
         bottom_words = _extract_words(bottom_crop)
         bottom_elements = _words_to_elements(
             bottom_words, pw, ph, region="bottom", px0=px0, py0=py0)
 
-        # Right column: right 45% of page, full height
-        # Expanded from 30% to 45% for right-side title blocks.
-        right_norm_x0 = pw * 0.55                             # 0-based
+        # Zone 3: Right-side vertical strip, right 25%, full height
+        # Covers right-margin title blocks (O'Neill, MAC, Ascot, Cera Stribley)
+        # that span the full page height.
+        right_norm_x0 = pw * 0.75                             # 0-based
         right_bbox_internal = (px0 + right_norm_x0, py0,
                                px0 + pw,            py0 + ph)
         right_crop = page.crop(right_bbox_internal)
@@ -150,7 +163,19 @@ def extract_regions(pdf_path, page_index=0):
         right_elements = _words_to_elements(
             right_words, pw, ph, region="right", px0=px0, py0=py0)
 
-        # Determine which region has more text → likely title block side
+        # Zone 4: Left-side vertical strip, bottom 30% only, left 15% width
+        # Covers GKA-style three-column revision tables in the left margin
+        # without capturing body content higher up the page.
+        left_x1 = pw * 0.15
+        left_y0 = ph * 0.70
+        left_bbox_internal = (px0,             py0 + left_y0,
+                              px0 + left_x1,   py0 + ph)
+        left_crop = page.crop(left_bbox_internal)
+        left_words = _extract_words(left_crop)
+        left_elements = _words_to_elements(
+            left_words, pw, ph, region="left", px0=px0, py0=py0)
+
+        # Determine which region has more text → title block side heuristic
         bottom_count = len(bottom_elements)
         right_count  = len(right_elements)
 
@@ -161,11 +186,11 @@ def extract_regions(pdf_path, page_index=0):
         else:
             side = "right"
 
-        # Merge elements (deduplicated — some elements may appear in both regions)
+        # Merge all three zones — deduplicated by (text + x + y)
         seen = set()
         merged = []
-        for el in bottom_elements + right_elements:
-            key = (el["text"], el["x"], el["y"])
+        for el in bottom_elements + right_elements + left_elements:
+            key = (el["text"], round(el["x"], 1), round(el["y"], 1))
             if key not in seen:
                 seen.add(key)
                 merged.append(el)
@@ -252,10 +277,18 @@ def extract_crop(pdf_path, page_index, x0, y0, x1, y1):
         right_words = _extract_words(page.crop((px0 + right_x0, py0, px0 + pw, py0 + ph)))
         right_elements = _words_to_elements(right_words, pw, ph, region="right_supp", px0=px0, py0=py0)
 
+        # Zone 4: left-side vertical strip, bottom 30% only (always)
+        # Captures GKA-style three-column revision tables in the left margin
+        # without pulling in body content higher up the page.
+        left_x1 = pw * 0.15
+        left_y0 = ph * 0.70
+        left_words = _extract_words(page.crop((px0, py0 + left_y0, px0 + left_x1, py0 + ph)))
+        left_elements = _words_to_elements(left_words, pw, ph, region="left_supp", px0=px0, py0=py0)
+
         # Merge all zones with deduplication — always applied
         seen = set()
         merged = []
-        for el in crop_elements + bottom_elements + right_elements:
+        for el in crop_elements + bottom_elements + right_elements + left_elements:
             key = (el["text"], round(el["x"], 1), round(el["y"], 1))
             if key not in seen:
                 seen.add(key)
